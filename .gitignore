@@ -1,0 +1,41 @@
+# Production configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data, backups, and deployment audit records
+/backups/
+/var/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+*.egg-info/
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/*.tsbuildinfo
+
+# Codex/editor working artifacts
+/.claude/settings.local.json
+/.codex-doc-review/
+/.codex-docx-review/
+/.codex-tmp/
+/backend/.codex-*.db
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+
+# Accidental local artifacts
+/80041adapter80041
+/buyer

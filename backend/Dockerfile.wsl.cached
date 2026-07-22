@@ -1,0 +1,12 @@
+FROM buyerreach-backend:latest
+
+USER root
+WORKDIR /buyerreach
+
+COPY app ./app
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
+RUN chown -R 1001:1001 /buyerreach
+
+ENTRYPOINT []
+USER 1001

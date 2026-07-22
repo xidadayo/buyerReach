@@ -1,0 +1,8 @@
+---
+description: BuyerReach authoritative architecture and delivery rules
+alwaysApply: true
+---
+
+Read and follow `docs/DEVELOPMENT_RULES.md` before editing any file. It is the repository's single source of truth.
+
+Read the nearest `AGENTS.md` for local constraints. Do not introduce Cursor-only architecture rules, bypass verification, or claim production readiness without the evidence required by the canonical rules.

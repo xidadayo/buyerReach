@@ -1,0 +1,1672 @@
+BuyerReach 买手通
+品牌客户发现与开发管理系统
+V1.0 产品需求文档（PRD）与开发规范
+文档版本
+V1.0
+系统名称
+BuyerReach 买手通
+文档用途
+产品立项、开发实施、测试验收、后续升级依据
+目标部署
+公司NAS或标准Linux服务器，Docker Compose部署
+核心技术栈
+Vue 3 + TypeScript / FastAPI / PostgreSQL / Redis / Celery / n8n / MinIO
+日期
+2026年7月
+文档说明
+本文件将BuyerReach系统的业务需求、产品范围、功能流程、数据结构、技术架构、开发约束、接口规范、测试要求、部署标准和验收标准合并为一份实施文档。开发团队应以本文件作为V1.0版本的范围基线。
+范围控制：V1.0以“品牌发现—官网确认—联系人发现—邮箱发现—邮箱验证—邮箱池管理—人工审核—导入导出”为完整闭环，不在第一版内建设大规模开发信发送、完整CRM或LinkedIn自动化抓取。
+版本
+日期
+内容
+状态
+V1.0
+2026-07
+首次形成完整PRD和开发规范
+基线版本
+目录
+第一部分：项目背景与产品定义
+第二部分：用户、场景与业务流程
+第三部分：V1.0功能需求
+第四部分：数据模型与状态体系
+第五部分：系统架构与扩展设计
+第六部分：V1.0开发规范
+第七部分：安全、合规与权限
+第八部分：测试、验收和交付
+第九部分：版本路线图与非功能范围
+第一部分 项目背景与产品定义
+1. 项目背景
+公司需要持续寻找海外品牌、零售商、进口商及其买手、采购、产品开发和供应链联系人。目前依赖人工搜索、Excel记录和分散的第三方工具，存在数据重复、邮箱准确率不清晰、来源不可追溯、人员协作困难及供应商锁定等问题。
+人工逐个搜索品牌官网和联系人，效率低。
+同一品牌通常存在多名有效联系人，现有表格难以表达一对多关系。
+邮箱来源、验证时间、验证服务及可信度无法统一记录。
+联系人离职、官网变更、邮箱失效后缺少更新机制。
+第三方平台数据难迁移，后续增加开发信、CRM和AI分析时容易推倒重建。
+2. 产品定位
+BuyerReach是一套部署在公司自有基础设施上的品牌客户发现与开发数据平台。系统通过品牌关键词、品牌名单、国家、品类和职位条件发现目标公司，确认官方网站，获取多个品牌联系人及公开邮箱，执行邮箱验证与评分，并将结果沉淀为可追溯、可去重、可分配、可导出的客户邮箱池。
+3. 产品目标
+目标编号
+目标
+V1衡量标准
+G1
+建立公司自有客户数据资产
+所有品牌、联系人、邮箱和验证记录保存在PostgreSQL
+G2
+形成完整获客闭环
+任务可从关键词输入运行至有效邮箱池
+G3
+提高数据可信度
+每个邮箱包含来源、验证状态、验证日期及评分
+G4
+支持一个品牌多个联系人
+品牌、公司、联系人、邮箱采用关系型结构
+G5
+保证系统可迁移
+Docker Compose部署，支持完整备份、恢复和导出
+G6
+降低后续重构成本
+服务适配器、API、事件、任务队列及扩展字段提前设计
+4. V1成功标准
+用户能够创建搜索任务并指定品牌关键词、国家、品类、目标职位和联系人数量。
+系统能够保存品牌、公司、官网、官网公开邮箱、多个联系人及其邮箱。
+邮箱经过格式、域名、MX及第三方验证后进入对应状态池。
+重复品牌、联系人和邮箱能够自动识别并进入合并流程。
+管理员可以配置数据源API、规则、任务额度和验证优先级。
+业务人员可以筛选、审核、分配、标记和导出有效联系人。
+系统能够在另一台支持Docker的服务器上恢复运行。
+5. V1非目标
+不实现绕过登录、验证码或平台限制的LinkedIn批量爬取。
+不实现高并发冷邮件群发和邮箱预热。
+不实现完整报价、样品、订单和销售预测CRM。
+不承诺邮箱验证100%准确；系统输出可信等级和风险状态。
+不以n8n、飞书多维表格或任何SaaS作为核心数据库。
+第二部分 用户、场景与业务流程
+6. 用户角色
+角色
+主要职责
+关键权限
+超级管理员
+系统初始化、升级、备份和最高权限管理
+全部权限
+系统管理员
+API配置、任务规则、数据源和用户管理
+系统配置、日志、备份
+数据管理员
+品牌、联系人、邮箱质量和重复数据处理
+编辑、合并、验证、导入导出
+销售主管
+客户分配、查看团队数据和统计
+部门数据、分配、导出
+业务员
+查看和维护本人客户、记录开发状态
+本人数据范围
+审核人员
+审核官网、联系人和风险邮箱
+审核和状态调整
+只读用户
+查看授权范围内的数据
+只读
+7. 核心使用场景
+场景
+输入
+系统输出
+精确品牌查找
+一个或多个明确品牌名
+官网、公司主体、多个联系人、邮箱及来源
+品牌发现
+国家+品类+品牌类型关键词
+候选品牌列表并继续丰富数据
+Excel名单丰富
+上传品牌或域名Excel
+补全官网、联系人、邮箱和验证结果
+官网公开信息采集
+品牌官网域名
+联系页面、团队页面、公开邮箱、电话和社媒
+联系人搜索
+品牌+目标职位词库
+按优先级返回多名联系人
+邮箱规则推断
+姓名+公司域名+已知邮箱模式
+候选邮箱及验证结果
+邮箱池管理
+有效、风险、无效等邮箱
+筛选、审核、分配、导出和黑名单控制
+8. 端到端业务流程
+创建搜索任务
+  → 品牌发现/品牌导入
+  → 官网候选识别
+  → 官网可信度确认
+  → 官网页面解析
+  → 联系人发现
+  → 邮箱公开发现或规则推断
+  → 邮箱验证与评分
+  → 品牌/联系人/邮箱去重
+  → 人工审核
+  → 有效邮箱池
+  → 分配、导出或后续开发系统调用
+9. 任务状态
+状态
+说明
+允许操作
+Draft
+任务草稿
+编辑、删除、启动
+Queued
+等待执行
+取消
+Running
+执行中
+暂停、查看进度
+Paused
+已暂停
+继续、终止
+Completed
+已完成
+查看、导出、重新运行
+Partial
+部分完成
+查看失败项、重试
+Failed
+失败
+查看错误、重试
+Cancelled
+已取消
+复制任务
+第三部分 V1.0功能需求
+10. 工作台
+显示品牌总数、联系人总数、邮箱总数、有效邮箱数、待审核数、无效数。
+显示当日和本月任务数、成功率、API调用次数和预计成本。
+显示最近任务、异常任务、待处理重复数据和待审核邮箱。
+显示邮箱有效率、来源分布、国家分布和职位分布。
+11. 搜索任务管理
+字段
+类型
+必填
+说明
+任务名称
+文本
+是
+便于识别任务
+任务模式
+单选
+是
+精确品牌/品牌发现/Excel导入
+品牌关键词
+多值文本
+条件必填
+品牌名称或发现关键词
+国家/地区
+多选
+否
+目标市场
+产品类别
+多选
+否
+如handbags、accessories
+公司类型
+多选
+否
+Brand、Retailer、Importer等
+目标职位
+多选
+是
+来自职位词库
+每品牌联系人上限
+整数
+是
+默认5，管理员可设最大值
+官网要求
+布尔
+否
+是否必须确认官网
+邮箱要求
+单选
+是
+全部/仅有效/有效与风险
+品牌数量上限
+整数
+是
+控制任务规模和成本
+预算上限
+金额
+否
+达到上限停止外部API调用
+支持保存草稿、启动、暂停、继续、取消、复制和重试。
+支持实时查看总进度以及品牌、官网、联系人、邮箱各阶段数量。
+失败任务必须保留错误原因、服务商、请求批次和重试次数。
+任务不得因用户关闭浏览器而停止，所有耗时工作进入后台队列。
+12. 品牌库与公司库
+品牌与公司主体分开存储，一个公司可拥有多个品牌。
+保存品牌标准名称、别名、官网、国家、城市、类别、公司类型、社媒链接、来源和更新时间。
+官网支持多个候选域名，但仅一个主官网；每个候选域名记录可信度和确认状态。
+品牌详情页展示官网邮箱、联系人列表、来源证据、标签、负责人和开发状态。
+支持手动新建、批量导入、编辑、归档、合并和重新丰富。
+13. 官网发现与解析
+通过搜索数据源返回官网候选，结合品牌名称、公司名称、国家、页面内容和社媒交叉判断。
+扫描首页、About、Contact、Team、Wholesale、Careers、Privacy、Terms、Press及Footer。
+提取公开邮箱、电话、地址、公司名称、社媒链接和联系表单URL。
+保存来源URL、抓取时间、页面标题、证据摘要和内容哈希。
+遵守robots、访问频率和超时规则；失败任务可重试，不得无限循环。
+14. 联系人发现
+按职位词库和职位优先级查找联系人。
+每个品牌默认最多保存5名目标联系人，但数据模型不设硬性一对一限制。
+保存姓名、职位、部门、所在国家、公司、公开资料链接、来源、在职状态和最后确认时间。
+联系人来源可以是商业数据API、公开网页、搜索结果或人工导入。
+LinkedIn链接仅作为资料字段和人工核实入口，V1不自动登录或批量抓取。
+优先级
+职位示例
+默认评分
+P1
+Buyer、Accessories Buyer、Head of Buying、Sourcing Manager、Procurement Manager
+100
+P2
+Product Development Manager、Merchandising Manager、Category Manager、Production Manager
+80
+P3
+Founder、Owner、Managing Director、Operations Director（小型品牌）
+70
+排除
+Intern、Student、Recruiter、Former Employee
+0
+15. 邮箱发现
+支持公开邮箱提取、商业数据服务返回、已知邮箱模式推断和人工录入。
+公开邮箱需记录具体来源URL；第三方返回邮箱需记录服务商和响应时间。
+推断邮箱必须保留推断规则，如firstname.lastname@domain。
+部门邮箱和个人邮箱分开分类。
+一个联系人可关联多个邮箱，并标记主邮箱。
+16. 邮箱验证与评分
+验证层级
+检查内容
+结果
+L1
+格式、长度、非法字符、一次性邮箱域名
+通过/失败
+L2
+域名解析和MX记录
+有效/无MX
+L3
+第三方邮箱验证API
+Valid/Risky/Invalid/Unknown
+L4
+Catch-all识别
+是/否/未知
+L5
+多来源交叉验证
+来源数量和一致性
+L6
+业务评分
+0-100可信分
+状态
+进入条件
+默认处理
+VALID
+验证明确有效且评分达到阈值
+进入有效邮箱池
+RISKY
+Catch-all或部分验证不确定
+人工审核或低风险测试
+UNKNOWN
+验证服务无法判断
+暂不发送，允许后续重验
+INVALID
+无效格式、无MX或明确不存在
+禁止发送
+DISPOSABLE
+一次性邮箱
+自动淘汰
+DO_NOT_CONTACT
+退订、投诉或人工黑名单
+永久禁止发送
+重要说明：验证服务不能保证100%准确。界面不得使用“绝对正确”表述，应显示验证状态、置信分、验证服务和验证时间。
+17. 邮箱池
+原始数据池：未经验证的候选邮箱。
+待验证池：已排队等待验证。
+人工审核池：Catch-all、来源冲突、职位不确定等。
+有效邮箱池：达到系统可用条件的邮箱。
+无效邮箱池：明确无效或一次性邮箱。
+禁止发送池：退订、投诉、硬退信和人工禁止记录，优先级最高。
+18. 人工审核中心
+审核官网候选、联系人归属、职位有效性、风险邮箱和重复数据。
+支持批准、驳回、修改、合并、标记待观察和加入黑名单。
+所有审核操作记录审核人、时间、原值、新值和原因。
+支持批量审核，但加入禁止发送池等高风险操作需二次确认。
+19. 去重与合并
+对象
+强匹配规则
+弱匹配规则
+品牌
+主官网根域名相同
+标准名称+国家相似
+公司
+注册名称或统一域名相同
+公司名称+地址相似
+联系人
+相同邮箱或相同公开资料URL
+姓名+公司+职位相似
+邮箱
+标准化后完全一致
+无弱匹配
+系统自动产生重复候选，不直接删除数据。
+合并时保留所有来源、验证历史、标签、负责人和操作日志。
+主记录由规则推荐，数据管理员最终确认。
+20. 导入导出
+支持CSV、XLSX导入品牌、域名、联系人和邮箱。
+导入前提供字段映射、预览、错误行下载和重复策略。
+支持按筛选条件导出品牌、联系人、邮箱、来源和验证状态。
+导出完整邮箱需具备专门权限并记录审计日志。
+提供JSON和REST API用于未来系统集成。
+21. 标签、自定义字段与配置中心
+品牌、联系人和邮箱支持手动标签与规则自动标签。
+管理员可创建文本、数字、日期、单选、多选、布尔、网址、邮箱、电话等自定义字段。
+职位词库、排除词、邮箱评分规则、数据源优先级、重试规则和任务并发必须配置化。
+V1可实现基础自定义字段，不要求复杂计算字段和跨对象公式。
+22. 用户、权限与审计
+采用RBAC角色权限和数据范围权限。
+支持本人、部门和全部数据三个基础范围。
+API密钥、完整邮箱导出、删除、合并、黑名单和系统配置为敏感权限。
+记录登录、查看敏感信息、导出、修改、删除、合并和权限变更日志。
+23. 飞书与通知
+V1支持通过Webhook向飞书发送任务完成、任务失败、API额度不足和待审核数量提醒。
+通知模块使用统一Provider接口，后续可以接入企业微信、邮件或Slack。
+飞书不作为核心数据库，不要求V1实现双向多维表格同步。
+第四部分 数据模型与状态体系
+24. 核心实体关系
+Organization 1—N User
+Company 1—N Brand
+Company 1—N ContactPosition
+Contact 1—N ContactPosition
+Contact 1—N EmailAddress
+Brand N—N Contact（通过职位/关系关联）
+EmailAddress 1—N VerificationRecord
+Brand/Contact/Email N—N SourceEvidence
+SearchTask 1—N TaskItem
+所有核心实体 1—N AuditLog
+25. 核心数据表
+表名
+用途
+关键字段
+organizations
+组织/租户预留
+id,name,status
+users
+用户
+id,organization_id,department_id,role_id
+companies
+公司主体
+legal_name,country,domain
+brands
+品牌
+name,company_id,primary_website,status
+websites
+官网和候选域名
+domain,is_primary,confidence,verified_at
+contacts
+自然人联系人
+first_name,last_name,country,status
+contact_positions
+职位历史
+contact_id,company_id,title,is_current
+emails
+邮箱
+contact_id,address,type,status,score
+email_verifications
+验证历史
+provider,result,score,checked_at
+source_evidence
+来源证据
+source_type,url,excerpt,captured_at
+search_tasks
+搜索任务
+mode,status,filters,progress
+task_items
+任务明细
+entity_type,stage,status,error
+tags
+标签定义
+name,module
+entity_tags
+实体标签关系
+entity_type,entity_id,tag_id
+custom_fields
+自定义字段定义
+module,name,type
+custom_values
+自定义字段值
+entity_type,entity_id,value
+blacklist
+禁止发送
+email/domain/reason
+audit_logs
+审计日志
+actor,action,before,after
+provider_configs
+数据源配置
+provider,type,priority,quota
+api_usage
+API使用成本
+provider,calls,cost,date
+26. 通用字段规范
+主键统一使用UUID。
+所有业务表包含created_at、updated_at、created_by、updated_by。
+需要软删除的表包含deleted_at和deleted_by，禁止直接物理删除核心业务数据。
+组织隔离表预留organization_id；业务归属预留owner_id和department_id。
+外部系统记录provider、external_id、raw_payload_hash和last_synced_at。
+时间统一在数据库保存UTC，前端按用户时区显示。
+27. 数据来源模型
+每个品牌、官网、联系人和邮箱可以关联多个来源证据。
+来源类型包括official_website、search_engine、commercial_api、public_directory、manual_import、manual_entry。
+来源保存URL、标题、摘要、抓取时间、服务商和可信等级。
+不得只保存最终值而丢弃数据来源。
+第五部分 系统架构与扩展设计
+28. V1技术架构
+浏览器
+  → Nginx / Traefik
+  → Vue 3 + TypeScript 管理后台
+  → FastAPI REST API
+       ├─ PostgreSQL：核心数据
+       ├─ Redis：缓存与任务消息
+       ├─ Celery Worker：异步任务
+       ├─ Celery Beat：定时任务
+       ├─ MinIO：网页证据与导入导出文件
+       └─ Provider Adapters：搜索、联系人、邮箱、验证、AI、通知
+  → n8n：跨系统流程编排和通知
+29. 模块边界
+模块
+V1职责
+不得包含
+Identity
+登录、用户、角色、数据范围
+业务规则
+Brand
+公司、品牌、官网和来源
+邮箱验证实现
+Contact
+联系人、职位、归属关系
+数据源供应商专有逻辑
+Email
+邮箱、状态、评分和黑名单
+具体第三方SDK耦合
+Discovery
+搜索任务和数据丰富流程
+前端页面逻辑
+Provider
+外部API适配器
+核心业务状态机
+Audit
+操作和安全审计
+业务对象修改逻辑
+ImportExport
+文件导入导出
+长期文件存储规则
+Notification
+飞书/Webhook通知
+核心任务调度
+30. Provider适配器规范
+interface CompanySearchProvider:
+    search_companies(criteria) -> ProviderResult
+
+interface ContactSearchProvider:
+    search_contacts(company, titles, limit) -> ProviderResult
+
+interface EmailFinderProvider:
+    find_emails(contact, domain) -> ProviderResult
+
+interface EmailVerifierProvider:
+    verify_email(address) -> VerificationResult
+
+interface SearchProvider:
+    search_web(query, limit) -> SearchResult
+
+interface NotificationProvider:
+    send(event, recipients, payload) -> SendResult
+适配器必须将第三方响应转换为系统标准模型。
+第三方原始响应可加密或脱敏保存用于排错，但不得直接成为业务表结构。
+适配器统一处理超时、限流、重试、错误映射和成本统计。
+更换服务商时不允许修改品牌、联系人或邮箱核心模块。
+31. 事件设计
+事件
+触发时机
+典型订阅者
+brand.created
+品牌创建成功
+官网发现任务
+website.verified
+主官网确认
+官网解析任务
+contact.discovered
+发现联系人
+邮箱发现任务
+email.discovered
+发现候选邮箱
+邮箱验证任务
+email.verified
+验证完成
+评分、邮箱池、通知
+duplicate.detected
+发现重复候选
+审核中心
+task.completed
+任务完成
+工作台、飞书通知
+provider.quota_low
+API额度低
+管理员通知
+32. 可扩展性约束
+前端不得直接调用第三方数据服务。
+任何外部服务必须通过Provider层接入。
+任何长耗时操作必须进入任务队列。
+任何可变化规则应配置化，不应硬编码。
+任何新模块通过API或事件与现有模块通信。
+V1数据库必须通过Alembic迁移管理，禁止人工直接改生产表结构。
+第六部分 V1.0开发规范
+33. 技术栈版本基线
+类别
+推荐技术
+规范
+前端
+Vue 3 + TypeScript + Vite
+Composition API，开启strict
+UI
+Element Plus或Ant Design Vue
+统一主题变量，不混用多套UI库
+后端
+Python 3.12 + FastAPI
+Pydantic v2，异步接口优先
+ORM
+SQLAlchemy 2.x
+Repository/Service分层
+迁移
+Alembic
+每次结构变更必须有迁移脚本
+数据库
+PostgreSQL 16+
+UTF-8，UTC时间
+缓存/队列
+Redis 7 + Celery
+任务幂等、可重试
+对象存储
+MinIO
+S3兼容接口
+流程编排
+n8n
+只做编排，不存核心状态
+网关
+Nginx或Traefik
+TLS、限流、反向代理
+部署
+Docker Compose
+不得依赖宿主机手工安装运行环境
+34. 后端目录规范
+backend/
+├── app/
+│   ├── api/v1/
+│   ├── core/
+│   ├── modules/
+│   │   ├── brands/
+│   │   ├── companies/
+│   │   ├── contacts/
+│   │   ├── emails/
+│   │   ├── discovery/
+│   │   ├── verification/
+│   │   ├── users/
+│   │   ├── audit/
+│   │   └── import_export/
+│   ├── providers/
+│   ├── tasks/
+│   ├── events/
+│   └── shared/
+├── migrations/
+├── tests/
+├── pyproject.toml
+└── Dockerfile
+35. 后端分层规范
+层
+职责
+禁止事项
+API/Router
+请求解析、鉴权、响应格式
+直接写SQL或调用第三方SDK
+Schema
+输入输出校验和序列化
+业务流程
+Service
+业务规则、状态变更、事务边界
+依赖具体Web框架对象
+Repository
+数据库查询和持久化
+外部API调用
+Provider
+第三方服务访问
+直接修改业务表
+Task
+异步任务编排和重试
+复制核心业务规则
+Event
+发布/订阅领域事件
+同步执行长耗时任务
+36. API规范
+所有接口使用/api/v1前缀。
+资源使用复数名词，例如/brands、/contacts、/emails。
+分页统一使用page、page_size，响应包含total、items、page、page_size。
+筛选参数统一使用明确名称，复杂条件使用POST /search而非超长查询字符串。
+写操作返回资源或任务ID；耗时操作返回202 Accepted和task_id。
+统一错误结构：code、message、details、request_id。
+所有接口生成OpenAPI文档。
+API必须支持幂等键的批量创建或任务启动接口。
+{
+  "code": "EMAIL_ALREADY_EXISTS",
+  "message": "邮箱已存在",
+  "details": {"email": "buyer@example.com"},
+  "request_id": "uuid"
+}
+37. 核心API清单
+方法
+路径
+用途
+POST
+/api/v1/search-tasks
+创建搜索任务
+POST
+/api/v1/search-tasks/{id}/start
+启动任务
+GET
+/api/v1/search-tasks/{id}
+查看任务和进度
+GET/POST
+/api/v1/brands
+品牌查询/新建
+GET/PATCH
+/api/v1/brands/{id}
+品牌详情/更新
+POST
+/api/v1/brands/{id}/enrich
+重新丰富
+GET/POST
+/api/v1/contacts
+联系人查询/新建
+GET/POST
+/api/v1/emails
+邮箱查询/新建
+POST
+/api/v1/emails/verify
+验证邮箱
+POST
+/api/v1/dedup/check
+执行重复检查
+POST
+/api/v1/dedup/merge
+合并记录
+POST
+/api/v1/imports
+创建导入任务
+POST
+/api/v1/exports
+创建导出任务
+GET/PATCH
+/api/v1/provider-configs
+数据源配置
+GET
+/api/v1/audit-logs
+审计日志
+38. 数据库开发规范
+表名和字段名使用snake_case英文。
+所有外键建立索引；高频筛选字段建立组合索引。
+邮箱保存标准化小写值，并对organization_id+normalized_address建立唯一约束。
+根域名保存标准化值，并考虑国际化域名转Punycode。
+JSONB仅用于第三方原始字段、动态筛选条件和非核心扩展信息，不替代规范化关系表。
+事务由Service层控制；跨模块更新应使用同一事务或事件最终一致性。
+生产环境禁止自动create_all，必须使用Alembic升级。
+39. 异步任务规范
+任务必须幂等：同一task_item重复执行不得产生重复核心记录。
+外部API失败采用指数退避，默认最多3次；认证失败和额度耗尽不自动重试。
+每个任务记录started_at、finished_at、attempts、provider、error_code和error_message。
+任务支持超时、取消和死信处理。
+批量任务按品牌或域名拆分为可独立重试的task_item。
+Celery Beat负责定期重验和数据质量任务，n8n不承担高频队列职责。
+40. 前端开发规范
+使用TypeScript严格模式，禁止核心业务使用any。
+API调用统一封装，自动处理Token、request_id、错误提示和取消请求。
+列表页统一支持分页、排序、筛选、保存筛选和列显示配置。
+所有状态颜色和标签由统一枚举映射，不在页面内散落硬编码。
+敏感邮箱默认可根据权限局部脱敏。
+批量删除、合并、导出和黑名单操作必须二次确认。
+任务进度通过轮询或SSE/WebSocket显示；V1可优先轮询。
+界面文字通过i18n文件管理，为英文后台预留。
+41. 代码质量规范
+项目
+要求
+格式化
+Python使用Ruff/Black；前端使用ESLint/Prettier
+类型检查
+Python使用mypy或pyright；TypeScript strict
+测试
+核心Service和状态机必须有单元测试
+覆盖率
+核心业务模块建议≥80%，整体≥70%
+提交信息
+使用Conventional Commits
+分支
+main、develop、feature/*、fix/*
+代码评审
+合并到main前至少一次Review
+密钥
+不得提交到Git，使用环境变量或Secrets
+42. 配置和环境变量
+APP_ENV=production
+DATABASE_URL=postgresql+asyncpg://...
+REDIS_URL=redis://redis:6379/0
+MINIO_ENDPOINT=minio:9000
+MINIO_ACCESS_KEY=...
+MINIO_SECRET_KEY=...
+JWT_SECRET=...
+ENCRYPTION_KEY=...
+PROVIDER_*_API_KEY=...
+FEISHU_WEBHOOK_URL=...
+提交.env.example但不得包含真实密钥。
+API密钥在数据库保存时必须加密。
+开发、测试、生产使用不同配置。
+所有配置在启动时校验，缺少必要变量应明确失败。
+43. 日志与可观测性
+后端输出结构化JSON日志，包含timestamp、level、request_id、user_id、module和message。
+不得在日志中输出完整API密钥、密码、Token或敏感个人数据。
+每次外部API调用记录服务商、耗时、状态、调用成本和request_id。
+V1至少提供健康检查/health、就绪检查/ready和任务队列状态。
+错误追踪可预留Sentry接口，监控可后续接入Prometheus/Grafana。
+第七部分 安全、合规与权限
+44. 身份认证
+V1采用用户名/邮箱+密码登录和JWT短期访问令牌。
+密码使用Argon2或bcrypt安全哈希。
+连续登录失败进行临时锁定或限流。
+管理员可禁用账号和强制重置密码。
+后续预留SSO和飞书身份登录接口。
+45. 数据安全
+生产环境必须启用HTTPS。
+数据库、MinIO和Redis不得直接暴露公网。
+API密钥、Webhook地址和必要敏感配置加密保存。
+备份文件加密并设置保留周期。
+导出文件设置有效期，下载需鉴权。
+删除采用软删除；真正物理清理需单独维护任务和审批。
+46. 数据合规与来源追溯
+系统只处理业务开发所需的公司和职业联系信息。
+保存数据来源、获取日期、使用目的、验证记录和删除/退订记录。
+禁止发送池对所有后续导入和采集具有最高优先级。
+不以自动化方式绕过登录、验证码、访问控制或平台条款。
+开发信模块上线前应另行制定目标市场适用的隐私、退订和邮件发送政策。
+47. 权限矩阵最低要求
+功能
+管理员
+数据管理员
+销售主管
+业务员
+只读
+API配置
+是
+否
+否
+否
+否
+品牌/联系人编辑
+是
+是
+有限
+本人
+否
+完整邮箱查看
+是
+是
+是
+本人
+按授权
+完整邮箱导出
+是
+按授权
+按授权
+否
+否
+合并重复数据
+是
+是
+否
+否
+否
+加入黑名单
+是
+是
+按授权
+申请
+否
+查看审计日志
+是
+部分
+否
+否
+否
+第八部分 测试、验收和交付
+48. 测试范围
+单元测试：评分、状态转换、去重、标准化、权限和Provider映射。
+集成测试：数据库、Redis、Celery、MinIO和至少一个测试Provider。
+API测试：鉴权、分页、筛选、错误结构、幂等和权限。
+端到端测试：创建任务至有效邮箱池的完整流程。
+安全测试：越权访问、敏感字段、导出、日志泄露和限流。
+部署测试：全新机器安装、备份、恢复和版本升级。
+49. V1关键验收用例
+编号
+验收场景
+通过标准
+AT-01
+创建精确品牌任务
+任务进入队列并产生进度记录
+AT-02
+同一品牌多个联系人
+品牌详情至少可保存并展示5名联系人
+AT-03
+官网邮箱提取
+邮箱保存来源URL和抓取时间
+AT-04
+邮箱验证
+保存服务商、原始结果映射、状态、分数和时间
+AT-05
+重复邮箱
+标准化后不产生重复核心记录
+AT-06
+Catch-all邮箱
+进入RISKY或人工审核，不自动标记VALID
+AT-07
+黑名单优先
+重新导入的禁止邮箱不能进入有效池
+AT-08
+任务失败重试
+可查看失败原因并仅重试失败明细
+AT-09
+权限控制
+业务员无法导出全部完整邮箱
+AT-10
+完整导出
+管理员可导出品牌+联系人+邮箱+来源+验证状态
+AT-11
+备份恢复
+在新环境恢复后数据、文件和配置可用
+AT-12
+服务商替换
+切换测试Provider不修改核心业务代码
+50. 性能基线
+指标
+V1目标
+普通列表接口
+95%请求在1秒内返回（不含外部API）
+详情接口
+95%请求在1秒内返回
+批量导入
+10,000行文件可异步处理并提供错误报告
+任务规模
+支持单任务至少1,000个品牌明细拆分处理
+并发用户
+公司内部20-50并发用户可稳定使用
+可用性
+内部系统目标99%，不含第三方服务故障
+备份
+每日数据库备份，至少保留30天；可配置
+51. 交付物
+完整源代码和Git仓库。
+docker-compose.yml、Dockerfile和.env.example。
+数据库初始化和Alembic迁移脚本。
+API文档和OpenAPI地址。
+管理员使用手册和部署手册。
+Provider接入说明和示例适配器。
+备份、恢复和升级脚本。
+自动化测试及测试报告。
+V1验收记录和已知问题清单。
+52. 部署验收
+在目标NAS或Linux服务器安装Docker与Docker Compose。
+复制项目和环境变量，执行单条或标准化命令启动全部服务。
+执行数据库迁移和管理员初始化。
+确认前端、API、任务Worker、定时任务、PostgreSQL、Redis、MinIO和n8n健康。
+完成一次搜索任务、一次导入、一次验证、一次导出。
+执行数据库和MinIO备份。
+在独立测试环境恢复备份并验证数据完整。
+第九部分 版本路线图与边界
+53. V1.0必须完成
+登录、用户、角色和基础数据权限。
+搜索任务及后台异步执行。
+品牌、公司、官网、联系人和邮箱关系模型。
+官网公开信息解析。
+至少一个联系人数据Provider、一个邮箱发现Provider和一个验证Provider的可插拔实现。
+邮箱状态、评分、邮箱池和禁止发送池。
+重复检测和人工合并。
+来源证据、审计日志、标签和基础自定义字段。
+CSV/XLSX导入导出。
+飞书Webhook通知。
+Docker Compose、备份恢复和迁移机制。
+54. V1.0只预留接口
+开发信账户、模板、序列、发送和回复模型。
+完整CRM商机、报价、样品和订单。
+AI客户分析和个性化开发信。
+第三方CRM双向同步。
+品牌官网新品监控和采购信号监控。
+手机端和浏览器插件。
+多组织商业化SaaS计费。
+55. 后续版本路线
+版本
+主题
+主要功能
+V1.5
+智能筛选和数据维护
+AI品牌分析、自动标签、联系人离职检查、定期重验、数据质量报告
+V2.0
+开发信平台
+邮箱账户、模板、序列、AI个性化、跟进、回复、退信和退订
+V2.5
+CRM协同
+客户分配、商机阶段、提醒、样品和报价关联、飞书审批
+V3.0
+智能外贸获客平台
+品牌动态、采购信号、多渠道触达、管理看板和智能推荐
+56. 最终架构原则
+数据归公司所有：第三方工具只作为数据服务。
+服务可替换：搜索、联系人、邮箱、验证、AI和通知均使用适配器。
+模块可扩展：新增功能不修改既有模块核心逻辑。
+规则可配置：职位词库、评分、验证和任务额度后台配置。
+全程可追溯：每条数据有来源、验证、修改和使用记录。
+升级可回滚：数据库迁移、升级前备份、失败可恢复。
+数据可导出：不被当前系统或SaaS锁定。
+附录A V1完成定义（Definition of Done）
+需求对应的接口、页面、权限、日志和测试全部完成。
+代码通过格式化、静态检查、单元测试和代码评审。
+数据库变更包含可执行的Alembic迁移。
+异常、空状态、加载状态和无权限状态均有界面处理。
+敏感信息不出现在源码、日志和前端响应中。
+API文档、部署文档和用户说明同步更新。
+功能在全新Docker环境完成部署验证。
+产品负责人依据验收用例确认通过。
+附录B 建议的首批开发迭代
+迭代
+重点
+主要交付
+Sprint 0
+工程基础
+仓库、CI、Docker、数据库、登录、权限骨架
+Sprint 1
+核心数据
+公司、品牌、官网、联系人、邮箱基础CRUD
+Sprint 2
+任务与Provider
+搜索任务、Celery、数据源适配器、进度
+Sprint 3
+官网与联系人丰富
+官网候选、网页解析、联系人发现
+Sprint 4
+邮箱验证与邮箱池
+验证、评分、状态机、审核中心
+Sprint 5
+去重与导入导出
+重复合并、Excel/CSV、标签和自定义字段
+Sprint 6
+通知、审计与部署
+飞书、日志、备份恢复、验收修复
+第二部分：后续版本产品需求与开发规范
+适用版本：V1.5、V2.0、V2.5、V3.0
+本部分用于指导 BuyerReach 在 V1.0 数据基础平台完成后的持续开发，明确每个版本的业务目标、功能边界、技术扩展、验收标准和版本依赖。
+57. 后续版本总体规划
+BuyerReach 的长期目标是从“品牌、联系人和邮箱数据平台”逐步升级为“外贸客户发现、智能筛选、开发信触达、CRM协同和采购信号监控的一体化客户开发平台”。后续版本必须继承 V1.0 的数据归属、模块化、适配器、API优先、可迁移和可追溯原则。
+版本
+版本定位
+核心价值
+主要依赖
+V1.0
+客户数据基础平台
+形成品牌—公司—联系人—邮箱—来源—验证的可信数据闭环
+基础架构
+V1.5
+智能筛选与数据维护
+提高目标客户匹配度、数据质量和自动更新能力
+V1.0完整上线
+V2.0
+开发信与多轮触达平台
+将有效联系人转化为可审计、可控的邮件开发流程
+V1.5评分和合规数据
+V2.5
+CRM销售协同平台
+承接回复、询盘、样品、报价和销售跟进
+V2.0邮件事件
+V3.0
+智能获客与采购信号平台
+持续监控市场信号并自动推荐高潜客户和开发策略
+V2.5 CRM数据闭环
+58. 跨版本统一开发原则
+所有新模块必须通过稳定的领域接口访问品牌、公司、联系人和邮箱数据，不得直接绕过业务层修改核心表。
+每个版本的数据库变更必须包含 Alembic 迁移、回滚说明和升级前备份检查。
+所有第三方服务继续使用 Provider/Adapter 机制，禁止将供应商特有字段扩散到核心领域模型。
+新增自动化功能必须提供人工暂停、人工审核、失败重试、额度限制和审计日志。
+任何发送、导出、删除、合并、退订和黑名单操作必须受权限控制并记录操作人。
+各版本新增页面必须兼容中文界面和未来英文国际化，界面文字不得写死。
+新增任务必须进入统一任务中心，记录进度、结果、消耗、错误和重试历史。
+版本升级不能破坏 V1.0 的 Excel/CSV/JSON 导出能力和 Docker 可移植部署能力。
+59. V1.5 智能筛选与数据维护版本
+59.1 版本目标
+V1.5 重点解决“数据已经找到，但哪些客户值得优先开发、联系人是否仍然有效、数据是否需要更新”的问题。该版本不负责自动发送开发信，而是为 V2.0 提供高质量、可分层、可持续维护的客户数据。
+59.2 业务目标
+根据公司目标客户标准自动计算品牌、公司和联系人的匹配评分。
+支持业务人员配置评分规则、目标职位、国家、产品类别和排除条件。
+建立联系人在职状态、邮箱时效性和官网变化的定期复查机制。
+通过自动标签、数据质量报告和人工审核队列减少无效数据。
+形成高潜客户池、普通客户池、待观察池和不符合池。
+59.3 功能范围
+模块
+V1.5必须功能
+主要输出
+客户画像规则
+配置目标国家、公司类型、产品类别、规模、价格带、渠道、职位和排除项
+可复用画像模板
+AI品牌分析
+读取官网公开内容，生成定位、产品、市场、渠道和合作匹配摘要
+品牌分析报告
+客户评分
+规则评分与AI辅助评分并存；保留评分明细和版本
+0—100分及等级
+自动标签
+按规则为品牌和联系人添加或移除标签
+高潜、轻奢、欧洲、买手等
+数据复查
+按周期重新检查官网、域名、邮箱和联系人状态
+更新任务与变化记录
+数据质量中心
+识别缺失、重复、冲突、过期和无来源数据
+质量指标与修复队列
+人工审核升级
+支持批量通过、驳回、合并、补充证据和转派
+可审计审核结果
+成本分析
+按任务、Provider和结果统计有效联系人获取成本
+成本看板
+59.4 新增页面
+客户画像模板
+AI分析任务
+客户评分中心
+高潜客户池
+数据质量中心
+定期复查计划
+变化记录
+成本与额度看板
+评分规则配置
+59.5 关键业务流程
+选择客户画像模板 → 批量选择品牌 → 官网内容分析 → 规则匹配 → AI辅助判断 → 生成评分明细 → 自动标签 → 高分进入高潜池 → 低分进入待观察或不符合池 → 人工复核
+到达复查日期 → 检查官网和域名 → 检查联系人任职证据 → 重新验证邮箱 → 对比旧数据 → 记录变化 → 触发评分重算 → 通知负责人
+59.6 数据模型扩展
+建议实体/表
+关键字段
+说明
+lead_profiles
+name, criteria_json, exclusion_json, version, status
+目标客户画像模板
+brand_analyses
+brand_id, provider, input_snapshot, result_json, model, created_at
+AI品牌分析及证据快照
+lead_scores
+entity_type, entity_id, score, grade, rule_version, breakdown_json
+评分及组成明细
+score_rules
+name, target_type, conditions_json, weight, enabled, version
+可配置评分规则
+review_schedules
+entity_type, interval_days, next_run_at, policy_json
+定期复查计划
+data_changes
+entity_type, entity_id, field, old_value, new_value, source_id
+数据变化记录
+quality_issues
+issue_type, entity_type, entity_id, severity, status, assignee
+质量问题队列
+provider_costs
+provider, task_id, units, amount, currency, result_count
+服务调用成本
+59.7 API扩展
+POST /api/v1/lead-profiles
+POST /api/v1/analyses/brands
+POST /api/v1/scores/calculate
+GET  /api/v1/scores/{entity_type}/{entity_id}
+POST /api/v1/reviews/schedules
+POST /api/v1/reviews/run
+GET  /api/v1/quality/issues
+POST /api/v1/quality/issues/{id}/resolve
+GET  /api/v1/analytics/provider-costs
+59.8 权限扩展
+配置客户画像和评分规则
+执行或重跑AI分析
+批量修改评分和标签
+处理数据质量问题
+查看Provider成本
+调整复查周期
+59.9 V1.5验收标准
+管理员可以在不修改代码的情况下建立并启用客户画像和评分规则。
+同一品牌可以查看评分总分、评分明细、规则版本和最后计算时间。
+系统能够批量分析品牌并在任务中心显示进度、成功数、失败数和费用。
+到期数据能够自动进入复查任务，变化不会覆盖历史记录。
+数据质量中心能够识别至少：重复品牌、无官网、无来源邮箱、过期验证、冲突状态和缺失负责人。
+所有AI结果必须标注模型、提示词版本、输入来源和生成时间，人工可以修正。
+59.10 V1.5不包含
+自动发送开发信
+邮箱预热
+完整邮件追踪
+CRM商机和报价
+社媒自动私信
+持续品牌动态监控
+60. V2.0 开发信与多轮触达版本
+60.1 版本目标
+V2.0 将高质量联系人池转化为可控的开发信触达流程。系统重点不是“大量群发”，而是通过账户健康、发送节奏、个性化审核、退信退订同步和自动停止机制，建立合规、低风险、可追溯的外贸开发信平台。
+60.2 业务目标
+管理多个发件邮箱、域名、发件身份和每日额度。
+按客户分层建立邮件模板、变量和多轮跟进序列。
+使用品牌资料和联系人信息生成个性化内容，并支持人工审核。
+自动处理发送成功、软退信、硬退信、回复、退订和投诉事件。
+防止同一联系人或同一品牌被重复、过度或跨业务员冲突联系。
+60.3 功能范围
+模块
+V2.0必须功能
+关键控制
+发件账户
+SMTP/API账户、发件人、域名、状态、每日额度和暂停
+密钥加密、健康状态
+模板中心
+主题、正文、变量、多语言、版本和适用客户画像
+审批与版本历史
+邮件序列
+第1封及后续步骤、等待时间、发送窗口、停止条件
+不得高于系统频率限制
+个性化生成
+基于品牌分析生成邮件草稿和切入点
+必须可人工预览修改
+活动管理
+选择客户池、去重、分配账户、启动、暂停和结束
+启动前风险检查
+发送队列
+按时区、发送窗口、账户额度和品牌频控排队
+限速与幂等
+事件回传
+送达、退信、回复、退订、投诉、打开/点击（可配置）
+事件签名与去重
+回复识别
+区分积极、消极、自动回复、休假、转介和退订
+低置信度人工审核
+抑制名单
+退订、投诉、硬退信、拒绝联系、品牌级禁止
+全局最高优先级
+效果分析
+发送、送达、退信、回复、积极回复及模板对比
+按账户、活动、国家、职位统计
+60.4 新增页面
+发件账户
+发件域名
+邮件模板
+邮件序列
+个性化草稿审核
+开发活动
+发送队列
+邮件事件
+回复中心
+退订与抑制名单
+开发效果报表
+60.5 发送前强制检查
+联系人邮箱状态必须符合可发送规则，且不在全局或品牌级禁止名单。
+联系人所属公司、邮箱域名和来源证据必须完整。
+同一联系人不得存在进行中的其他活动；同一品牌须满足联系人数和间隔限制。
+发件账户必须启用、未超额度、未处于暂停或异常状态。
+模板必须通过审批，变量渲染后不得为空或出现占位符残留。
+活动必须配置退订方式、停止条件、发送窗口和负责人。
+60.6 核心状态
+对象
+状态建议
+发件账户
+draft / active / paused / unhealthy / disabled
+邮件活动
+draft / validating / ready / running / paused / completed / cancelled
+邮件步骤
+pending / scheduled / sending / sent / skipped / failed
+邮件事件
+delivered / soft_bounce / hard_bounce / replied / unsubscribed / complained
+回复意向
+positive / neutral / negative / referral / out_of_office / unsubscribe / unknown
+60.7 数据模型扩展
+建议实体/表
+关键字段
+说明
+sending_accounts
+provider, email, sender_name, encrypted_credentials, daily_limit, status
+发件账户
+sending_domains
+domain, verification_status, policy_json, health_status
+发件域名状态
+email_templates
+name, subject, body, language, version, approval_status
+模板版本
+email_sequences
+name, profile_id, status, stop_rules_json
+邮件序列
+sequence_steps
+sequence_id, step_no, delay_hours, template_id, send_window_json
+序列步骤
+campaigns
+name, owner_id, pool_filter_json, sequence_id, status
+开发活动
+campaign_recipients
+campaign_id, contact_id, email_id, status, suppression_reason
+活动联系人
+email_messages
+recipient_id, account_id, rendered_subject, rendered_body, status
+实际发送邮件
+email_events
+message_id, event_type, provider_event_id, payload_json, occurred_at
+邮件事件
+email_replies
+message_id, intent, confidence, body_snapshot, review_status
+回复识别
+suppressions
+scope, value, reason, source, created_at
+全局/品牌/域名抑制
+60.8 API扩展
+POST /api/v1/sending-accounts
+POST /api/v1/email-templates
+POST /api/v1/email-sequences
+POST /api/v1/campaigns
+POST /api/v1/campaigns/{id}/validate
+POST /api/v1/campaigns/{id}/start
+POST /api/v1/campaigns/{id}/pause
+POST /api/v1/email-events/webhook/{provider}
+GET  /api/v1/replies
+POST /api/v1/replies/{id}/classify
+POST /api/v1/suppressions
+60.9 异步任务与幂等要求
+每一封实际邮件必须有唯一发送幂等键，任务重试不得造成重复发送。
+发送任务按账户、域名、联系人和品牌四个维度限速。
+Webhook事件使用 provider_event_id 去重，乱序事件应可正确合并。
+发送失败采用可配置重试策略；硬退信、投诉和退订不得重试。
+序列调度必须在回复、退订、硬退信或人工停止后立即取消后续步骤。
+60.10 V2.0验收标准
+管理员可配置多个发件账户及每日额度，密钥不以明文展示。
+业务员可以建立草稿活动，系统在启动前输出重复、无效邮箱、抑制名单和额度风险。
+模板变量可以预览，并能为每位联系人保存最终渲染内容。
+同一发送任务重复执行不会产生第二封邮件。
+硬退信、退订和投诉事件能够自动进入抑制名单并停止后续序列。
+回复能够关联到原联系人、品牌、活动和邮件线程，并进入回复中心。
+报表可按活动、账户、模板、国家、职位和业务员查看核心指标。
+60.11 V2.0不包含
+自建邮箱预热网络
+规避邮件服务商限制的技术
+LinkedIn自动私信
+完整销售商机和报价流程
+复杂营销自动化画布
+多渠道短信或WhatsApp群发
+61. V2.5 CRM销售协同版本
+61.1 版本目标
+V2.5 用于承接开发信回复和人工获取的询盘，将品牌、联系人、沟通、任务、样品、报价和商机统一到销售协同流程。该版本应避免重复建设ERP，重点管理“从回复到成交前”的客户开发过程。
+61.2 功能范围
+模块
+V2.5必须功能
+核心结果
+线索分配
+按地区、产品、业务员负载或手动规则分配
+明确负责人
+客户时间线
+邮件、备注、任务、文件、状态变更统一展示
+完整沟通上下文
+销售管道
+自定义阶段、阶段规则、预计金额、预计日期
+可视化商机漏斗
+任务提醒
+电话、邮件、会议、样品和报价跟进任务
+避免遗漏
+询盘管理
+记录需求、产品、数量、目标价、交期和附件
+结构化客户需求
+样品记录
+样品需求、寄送、物流、费用、反馈和结果
+样品闭环
+报价记录
+报价版本、币种、贸易条款、有效期和附件
+报价可追溯
+协作与审批
+转派、评论、@通知、样品费/报价审批
+团队协同
+飞书集成
+提醒、审批结果和重点回复推送
+移动协同
+销售报表
+线索、回复、商机、样品、报价和转化率
+管理看板
+61.3 新增页面
+我的客户
+待分配线索
+客户360详情
+销售管道
+询盘中心
+样品管理
+报价管理
+跟进任务
+审批中心
+销售报表
+团队工作量
+61.4 客户360详情要求
+品牌和公司基本资料、官网分析、评分和标签。
+所有联系人及其职位、邮箱、验证和在职状态。
+开发活动、邮件、回复、会议、备注和附件时间线。
+当前询盘、商机阶段、预计金额、成交概率和下一步行动。
+样品、报价、物流、客户反馈及相关审批记录。
+负责人、协作人、部门和权限范围。
+61.5 销售流程建议
+新回复/人工线索 → 待分配 → 已联系 → 需求确认 → 样品/方案 → 报价 → 谈判 → 赢单 / 输单 / 暂停
+阶段名称和顺序必须可配置，但系统应支持阶段进入条件、必填字段和停留时长预警。
+61.6 数据模型扩展
+建议实体/表
+关键字段
+说明
+leads
+brand_id, primary_contact_id, source, owner_id, status
+销售线索
+opportunities
+lead_id, pipeline_id, stage_id, amount, probability, expected_close_date
+商机
+pipelines
+name, department_id, status
+销售管道
+pipeline_stages
+pipeline_id, name, order_no, required_fields_json, sla_days
+管道阶段
+activities
+entity_type, entity_id, activity_type, owner_id, due_at, status
+跟进活动
+inquiries
+opportunity_id, requirements_json, quantity, target_price, delivery_date
+询盘需求
+samples
+opportunity_id, sample_no, status, cost, courier, tracking_no
+样品记录
+sample_feedback
+sample_id, feedback, result, attachments
+样品反馈
+quotations
+opportunity_id, version, currency, incoterm, total_amount, valid_until
+报价
+approvals
+object_type, object_id, workflow_key, status, requester_id
+审批记录
+crm_timeline
+entity_type, entity_id, event_type, payload_json, created_at
+客户时间线
+61.7 API扩展
+POST /api/v1/leads/assign
+POST /api/v1/opportunities
+PATCH /api/v1/opportunities/{id}/stage
+POST /api/v1/activities
+POST /api/v1/inquiries
+POST /api/v1/samples
+POST /api/v1/samples/{id}/feedback
+POST /api/v1/quotations
+POST /api/v1/approvals
+GET  /api/v1/customers/{brand_id}/timeline
+61.8 权限与数据隔离
+业务员默认仅查看本人客户和被邀请协作的客户。
+销售主管可查看本部门数据并执行分配、转派和阶段修正。
+报价金额、利润字段和客户邮箱导出可设置独立权限。
+跨部门转派必须记录原负责人、新负责人、原因和时间。
+删除商机、样品或报价原则上采用归档，永久删除仅限管理员。
+61.9 V2.5验收标准
+邮件积极回复可以一键创建线索并继承品牌、联系人、来源和邮件上下文。
+线索能够按照规则自动分配，也能由主管批量转派。
+商机阶段可配置，进入关键阶段时能校验必填字段。
+客户详情中能够按时间顺序查看邮件、任务、询盘、样品和报价。
+样品和报价均支持版本、附件、负责人、状态和审计记录。
+系统可以生成业务员、部门、来源和阶段维度的转化报表。
+61.10 V2.5不包含
+生产订单执行
+采购和工厂进度管理
+财务应收应付
+仓库库存
+完整ERP
+复杂合同电子签署
+62. V3.0 智能获客与采购信号平台
+62.1 版本目标
+V3.0 在已有客户数据、邮件互动和CRM转化结果的基础上，建立持续的品牌动态监控和采购信号识别能力。系统不再只依赖人工输入关键词，而是主动发现值得开发的新品牌、品牌变化和最佳联系时机。
+62.2 功能范围
+模块
+V3.0必须功能
+业务价值
+品牌监控
+监控官网关键页面、产品分类、新品、门店、新闻和招聘变化
+发现业务变化
+采购信号
+基于新品、招聘、扩品类、市场扩张、融资、展会等信号评分
+选择联系时机
+相似客户推荐
+根据已回复或成交客户推荐相似品牌
+扩大高质量客户池
+智能开发建议
+生成联系人优先级、产品切入点、证据和建议动作
+提升个性化程度
+机会预警
+信号达到阈值时创建待审核机会并通知负责人
+主动获客
+知识库
+沉淀公司能力、产品、案例、证书和常见问答
+支撑AI生成
+多市场分析
+按国家、品类、渠道、职位和信号分析转化
+优化市场策略
+管理驾驶舱
+展示客户增长、信号、触达、回复、商机和转化趋势
+辅助决策
+62.3 信号类型建议
+官网新增箱包、配饰、旅行用品或可持续材料相关分类。
+品牌发布新品系列、联名、季节系列或进入新价格带。
+招聘 Buyer、Sourcing、Product Development、Production 或 Supply Chain 职位。
+新增国家站点、门店、批发渠道、零售合作或国际市场。
+参加相关展会、获得融资、进行品牌升级或更换供应链负责人。
+历史联系人回复、转介、离职或新负责人上任。
+62.4 监控流程
+配置监控范围 → 定时抓取公开页面 → 内容标准化 → 与上次快照比较 → 生成变化事件 → 信号分类和评分 → 去重 → AI摘要 → 人工审核 → 创建客户任务或商机
+62.5 数据模型扩展
+建议实体/表
+关键字段
+说明
+monitoring_targets
+entity_type, entity_id, url, target_type, frequency, status
+监控目标
+page_snapshots
+target_id, content_hash, extracted_json, storage_key, captured_at
+页面快照
+change_events
+target_id, change_type, before_ref, after_ref, summary, confidence
+变化事件
+buying_signals
+brand_id, signal_type, score, evidence_json, occurred_at, status
+采购信号
+recommendations
+brand_id, recommendation_type, rationale, score, model_version
+AI推荐
+similarity_profiles
+brand_id, vector_ref, features_json, updated_at
+相似客户特征
+knowledge_documents
+category, title, version, storage_key, status
+企业知识库文档
+alert_rules
+name, conditions_json, channels_json, enabled
+预警规则
+62.6 AI治理要求
+AI推荐必须附带可查看的公开证据，不允许只给出无法解释的结论。
+信号评分应区分规则分、模型分和人工修正分。
+模型和提示词升级后保留版本，并支持对历史样本进行回归评估。
+高风险动作（自动创建活动、自动发送）默认关闭，须经管理员开启并设置审批。
+知识库内容必须有版本、有效期、负责人和适用范围。
+62.7 API扩展
+POST /api/v1/monitoring/targets
+POST /api/v1/monitoring/run
+GET  /api/v1/change-events
+GET  /api/v1/buying-signals
+POST /api/v1/buying-signals/{id}/review
+GET  /api/v1/recommendations/brands/{id}
+GET  /api/v1/similar-brands/{id}
+POST /api/v1/knowledge/documents
+POST /api/v1/alert-rules
+62.8 V3.0验收标准
+系统能够对已配置的官网页面生成快照并识别真实内容变化，重复内容不重复告警。
+采购信号包含类型、时间、证据、评分、置信度和处理状态。
+管理员可配置哪些信号组合达到阈值后通知业务员或创建待审核线索。
+相似客户推荐能够说明相似维度，并可排除已开发、已拒绝或不符合客户。
+AI开发建议能够结合公司知识库、品牌变化和联系人职位输出建议，但默认不自动发送。
+管理驾驶舱能够展示从信号发现到回复、商机和成交的完整漏斗。
+62.9 V3.0不包含
+绕过网站访问控制的抓取
+LinkedIn登录态批量抓取
+未经审核的全自动大规模发送
+替代ERP生产和财务系统
+无证据的自动客户决策
+63. 版本依赖与升级顺序
+前置版本
+后续版本依赖内容
+不得跳过原因
+V1.0 → V1.5
+品牌、联系人、邮箱、来源、验证、任务、日志
+评分和复查必须基于可信主数据
+V1.5 → V2.0
+客户画像、评分、标签、数据质量、抑制前置字段
+开发信必须使用筛选后的有效联系人
+V2.0 → V2.5
+邮件、回复、事件、活动和负责人关系
+CRM需要继承真实沟通上下文
+V2.5 → V3.0
+商机阶段、结果、样品、报价和转化数据
+推荐模型需要真实业务结果校准
+允许在业务需要时提前开发某个独立子功能，但数据模型和事件接口必须遵守上述依赖，不得通过临时表或重复联系人库绕开核心平台。
+64. 跨版本领域模块边界
+领域模块
+负责内容
+不得负责
+Discovery
+品牌、官网、联系人和公开信息发现
+直接发送邮件或修改CRM阶段
+Verification
+邮箱和数据有效性验证
+决定销售优先级
+Scoring
+画像、规则、AI评分和标签
+覆盖人工禁止状态
+Outreach
+模板、序列、发送、事件和抑制
+管理样品生产
+CRM
+线索、商机、任务、询盘、样品和报价
+直接抓取外部网站
+Monitoring
+页面快照、变化、信号和预警
+绕过人工审批发送
+Identity & Access
+用户、部门、角色和数据权限
+承载业务规则
+Audit & Compliance
+来源、操作、同意/退订、导出和审计
+生成业务数据
+65. 后续版本非功能性要求
+65.1 性能与容量
+阶段
+建议容量基线
+性能要求
+V1.5
+50万联系人、100万邮箱记录、每日5万复查任务
+常用列表P95小于2秒；批量任务异步
+V2.0
+每日1万封以内可控发送、千万级邮件事件
+发送队列可水平扩展；事件写入幂等
+V2.5
+10万活跃品牌、5万商机、百万级时间线事件
+客户详情首屏P95小于3秒
+V3.0
+10万监控目标、每日百万级页面/信号记录（按部署能力调整）
+快照存储与业务库分离；支持归档
+65.2 可用性
+后台核心业务月可用性目标不低于99.5%。
+第三方Provider不可用时，任务应进入重试或备用Provider，不影响已保存数据。
+任务、发送和Webhook消费者支持水平扩展。
+数据库、MinIO和配置文件应有自动备份及恢复演练。
+65.3 安全
+API密钥、SMTP凭据和Webhook密钥使用加密存储。
+所有外部Webhook必须验证签名或共享密钥。
+导出邮箱、查看完整邮箱和批量发送纳入高敏权限。
+支持登录失败限制、会话失效、操作审计和可选双因素认证。
+敏感正文和凭据不得写入普通应用日志。
+65.4 可观测性
+统一结构化日志并包含 trace_id、task_id、user_id 和 provider。
+统计任务成功率、队列积压、Provider错误率、发送事件延迟和成本。
+关键错误通过飞书或邮件告警。
+每个版本发布后配置核心业务健康检查和Grafana看板。
+66. 版本发布与兼容规范
+采用语义化版本：主版本.次版本.修订版本，例如 2.0.0。
+API 默认使用 /api/v1 路径；破坏性变更必须新增API版本并提供迁移周期。
+数据库迁移必须先在测试环境使用生产数据脱敏副本验证。
+新功能使用 Feature Flag 分阶段启用，涉及发送、AI自动化和监控的功能默认关闭。
+发布包必须包含 changelog、迁移说明、配置差异、回滚步骤和验收清单。
+旧字段废弃必须先标记 deprecated，至少跨一个次版本后才能删除。
+Provider响应应保存原始结果或可追溯摘要，适配器升级不得破坏历史数据。
+67. 各版本测试策略
+测试类型
+V1.5重点
+V2.0重点
+V2.5重点
+V3.0重点
+单元测试
+评分规则、标签、变化对比
+模板渲染、限速、抑制
+阶段校验、金额计算
+变化识别、信号评分
+集成测试
+AI/Provider失败切换
+邮件Provider和Webhook
+邮件到线索、飞书审批
+抓取、快照、知识库
+幂等测试
+重复复查任务
+重复发送和重复事件
+重复创建线索
+重复页面和重复告警
+权限测试
+规则和成本权限
+账户、发送、导出权限
+部门和客户数据隔离
+监控范围和知识库权限
+回归测试
+V1数据完整性
+退订/黑名单优先级
+时间线和邮件关系
+历史信号和模型版本
+68. 版本交付物要求
+完整源代码、Docker部署配置和环境变量样例。
+数据库迁移脚本、回滚说明及数据字典更新。
+OpenAPI文档、Webhook文档和Provider适配器说明。
+功能使用说明、管理员配置说明和权限矩阵。
+自动化测试报告、关键性能测试报告和安全检查结果。
+版本验收用例、已知限制和后续优化清单。
+生产升级步骤、备份确认、回滚演练记录和发布日志。
+69. 后续版本优先级建议
+建议严格按照“数据质量优先、发送安全其次、CRM承接回复、最后做主动监控”的顺序推进。若V1.0上线后业务团队急需开发信，可在V1.5中优先完成客户评分、抑制名单和数据复查，再进入V2.0最小发送闭环，不能直接跳过邮箱质量和停止规则。
+优先级
+建议先开发
+原因
+P0
+V1.5评分、质量中心、复查；V2.0抑制名单、账户、模板、发送幂等
+直接决定数据和发送风险
+P1
+活动、序列、回复中心；V2.5线索、任务和客户时间线
+形成业务闭环
+P2
+样品、报价、审批、详细报表
+提高团队协同效率
+P3
+品牌监控、相似客户、采购信号和管理驾驶舱
+依赖前期高质量历史数据
+附录C 后续版本完成定义（Definition of Done）
+需求、原型、接口、数据结构、权限、日志、监控和测试均已完成并评审。
+所有新增数据库结构均通过迁移脚本创建，禁止生产环境手工改表。
+涉及自动操作的功能具备暂停、重试、幂等、额度和人工接管能力。
+涉及AI的功能记录模型、提示词版本、输入证据、输出和人工修正。
+涉及邮件的功能通过抑制名单、退订、硬退信、投诉和重复发送测试。
+涉及CRM的数据权限通过本人、部门、全局三种范围测试。
+在全新Docker环境完成安装，在上一正式版本数据副本上完成升级和回滚验证。
+最终文档、用户说明、运维说明和变更日志与代码同步交付。

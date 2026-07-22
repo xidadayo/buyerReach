@@ -1,0 +1,6 @@
+# Offline deployment layer. Reuses the last verified application image when
+# the configured Docker registry mirror is unavailable.
+FROM buyerreach-backend:latest
+COPY app ./app
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini

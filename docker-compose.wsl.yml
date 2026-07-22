@@ -1,0 +1,71 @@
+x-buyerreach-proxy-env: &buyerreach-proxy-env
+  HTTP_PROXY: http://host.docker.internal:17892
+  HTTPS_PROXY: http://host.docker.internal:17892
+  NO_PROXY: localhost,127.0.0.1,postgres,redis,minio,n8n,backend,frontend,email-verifier,host.docker.internal
+  http_proxy: http://host.docker.internal:17892
+  https_proxy: http://host.docker.internal:17892
+  no_proxy: localhost,127.0.0.1,postgres,redis,minio,n8n,backend,frontend,email-verifier,host.docker.internal
+
+x-buyerreach-host-gateway: &buyerreach-host-gateway
+  - "host.docker.internal:host-gateway"
+
+services:
+  email-verifier:
+    build:
+      context: ./services/email-verifier
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      REDIS_URL: redis://redis:6379/2
+    expose:
+      - "8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+  proxy-relay:
+    image: buyerreach-backend:latest
+    restart: unless-stopped
+    network_mode: host
+    command: python -m app.proxy_relay
+    environment:
+      PROXY_RELAY_LISTEN_HOST: 0.0.0.0
+      PROXY_RELAY_LISTEN_PORT: 17892
+      PROXY_RELAY_UPSTREAM_HOST: wsl-default-gateway
+      PROXY_RELAY_UPSTREAM_PORT: 17891
+      PROXY_RELAY_ALLOWED_CIDRS: 172.16.0.0/12
+
+  backend:
+    build:
+      dockerfile: Dockerfile.wsl
+    environment:
+      <<: *buyerreach-proxy-env
+    extra_hosts: *buyerreach-host-gateway
+
+  frontend:
+    build:
+      dockerfile: Dockerfile.wsl
+    ports: !override
+      - "5173:80"
+
+  celery-worker:
+    environment:
+      <<: *buyerreach-proxy-env
+    extra_hosts: *buyerreach-host-gateway
+
+  celery-enrichment-worker:
+    environment:
+      <<: *buyerreach-proxy-env
+    extra_hosts: *buyerreach-host-gateway
+
+  celery-beat:
+    environment:
+      <<: *buyerreach-proxy-env
+    extra_hosts: *buyerreach-host-gateway
