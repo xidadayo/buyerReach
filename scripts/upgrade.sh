@@ -78,7 +78,7 @@ if [ "$TARGET_COMMIT" = "$PREVIOUS_COMMIT" ]; then
 fi
 
 compose() {
-  COMPOSE_FILE="$COMPOSE_FILES" docker compose --env-file "$ENV_FILE" "$@"
+  COMPOSE_FILE="$COMPOSE_FILES" APP_ENV_FILE="$ENV_FILE" docker compose --env-file "$ENV_FILE" "$@"
 }
 
 # Compose paths containing spaces are not supported by the portable argument
@@ -125,12 +125,16 @@ trap audit_early_failure EXIT INT TERM
 
 echo 'Validating the current deployment...'
 compose config --quiet
-compose exec -T postgres pg_isready -U buyerreach -d buyerreach >/dev/null
+compose exec -T postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null
 MIGRATION_BEFORE=$(compose run --rm backend alembic current 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 audit_event preflight_passed "migration_before=$MIGRATION_BEFORE"
 
 echo "Creating encrypted pre-upgrade backup for $PREVIOUS_COMMIT..."
-BACKUP_PASSPHRASE=$BACKUP_PASSPHRASE BACKUP_OUTPUT_FILE=$BACKUP_OUTPUT_FILE sh ./scripts/backup.sh
+BACKUP_PASSPHRASE=$BACKUP_PASSPHRASE \
+BACKUP_OUTPUT_FILE=$BACKUP_OUTPUT_FILE \
+ENV_FILE=$ENV_FILE \
+COMPOSE_FILES=$COMPOSE_FILES \
+  sh ./scripts/backup.sh
 BACKUP_ARCHIVE=$(cat "$BACKUP_OUTPUT_FILE")
 audit_event backup_created "archive=$BACKUP_ARCHIVE"
 trap - EXIT INT TERM

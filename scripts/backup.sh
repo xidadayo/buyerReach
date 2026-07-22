@@ -4,6 +4,7 @@ set -eu
 BACKUP_DIR=${BACKUP_DIR:-./backups}
 BACKUP_PASSPHRASE=${BACKUP_PASSPHRASE:?Set BACKUP_PASSPHRASE before running a backup}
 ENV_FILE=${ENV_FILE:-.env}
+COMPOSE_FILES=${COMPOSE_FILES:-docker-compose.yml}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 WORK_DIR=$(mktemp -d)
 ARCHIVE="$BACKUP_DIR/buyerreach-$STAMP.tar.gz"
@@ -14,10 +15,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$BACKUP_DIR"
-docker compose exec -T postgres pg_dump -U buyerreach buyerreach > "$WORK_DIR/database.sql"
+compose() {
+  COMPOSE_FILE="$COMPOSE_FILES" APP_ENV_FILE="$ENV_FILE" docker compose --env-file "$ENV_FILE" "$@"
+}
+
+compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > "$WORK_DIR/database.sql"
 test -s "$WORK_DIR/database.sql"
 
-MINIO_CONTAINER=$(docker compose ps -q minio)
+MINIO_CONTAINER=$(compose ps -q minio)
 test -n "$MINIO_CONTAINER"
 docker run --rm --volumes-from "$MINIO_CONTAINER" -v "$WORK_DIR:/backup" alpine:3.20 \
   sh -c 'tar -czf /backup/minio-data.tar.gz -C / data'

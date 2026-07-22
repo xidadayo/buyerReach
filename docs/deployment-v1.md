@@ -31,6 +31,10 @@ the local Vendor restores the original ZeroBounce/Hunter path for new tasks.
 - Ports available: `5173`, `8000`, `5432`, `6379`, `9000`, `9001`, `5678`
 - Production environment variables copied from `.env.example` and changed before launch
 
+The production `.env` must keep `DATABASE_URL`, `POSTGRES_*`, `MINIO_ACCESS_KEY`,
+`MINIO_SECRET_KEY`, and `MINIO_ROOT_*` mutually consistent. Never deploy the
+development passwords from `.env.example` to a NAS.
+
 ## Start
 
 ```bash
@@ -92,6 +96,9 @@ ENV_FILE=/volume1/docker/buyerreach/.env \
 COMPOSE_FILES=docker-compose.yml:/volume1/docker/buyerreach/compose.prod.yml \
   sh ./scripts/upgrade.sh v1.1.0
 ```
+
+`ENV_FILE` is used both for Compose interpolation and as the application
+services' `env_file`; it is therefore the single source of runtime secrets.
 
 Set `AUDIT_DIR` to persistent NAS storage. Each attempt writes an append-only
 JSONL record containing the requested version, old/new commits, migration
