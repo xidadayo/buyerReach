@@ -1,4 +1,6 @@
-from sqlalchemy import create_engine, select
+from uuid import uuid4
+
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import Base
@@ -15,11 +17,128 @@ from app.modules.services import (
     export_selected_emails_csv,
     list_brands,
     list_brand_hierarchy,
+    list_contacts,
     refresh_contact_status,
     list_emails,
 )
 from app.shared.enums import EmailPool
 from app.shared.models import utc_now
+
+
+def test_contact_creation_is_idempotent_for_repeated_exact_brand_tasks() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine, autoflush=False) as db:
+        brand = Brand(name="Castro", normalized_name="castro")
+        db.add(brand)
+        db.flush()
+        payload = ContactCreate(
+            brand_id=brand.id,
+            first_name="Osher",
+            last_name="Balouka",
+            title="Accessories Category Buyer",
+            linkedin_url="https://linkedin.com/in/osher/",
+        )
+
+        first = create_contact(db, payload, provider="apollo")
+        second = create_contact(
+            db,
+            payload.model_copy(update={"linkedin_url": "https://linkedin.com/in/osher"}),
+            provider="hunter",
+        )
+
+        assert second.id == first.id
+        assert db.scalar(select(func.count(Contact.id))) == 1
+        assert db.scalar(select(func.count(ContactPosition.id))) == 1
+
+
+def test_fallback_contact_identity_is_scoped_by_brand() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine, autoflush=False) as db:
+        first_brand = Brand(name="First", normalized_name="first")
+        second_brand = Brand(name="Second", normalized_name="second")
+        db.add_all([first_brand, second_brand])
+        db.flush()
+
+        first = create_contact(
+            db,
+            ContactCreate(
+                brand_id=first_brand.id,
+                first_name="Alex",
+                last_name="Lee",
+                title="Buyer",
+            ),
+        )
+        second = create_contact(
+            db,
+            ContactCreate(
+                brand_id=second_brand.id,
+                first_name="Alex",
+                last_name="Lee",
+                title="Buyer",
+            ),
+        )
+
+        assert first.id != second.id
+        assert db.scalar(select(func.count(Contact.id))) == 2
+
+
+def test_linkedin_identity_and_contact_search_are_scoped_by_organization() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine, autoflush=False) as db:
+        first_org = uuid4()
+        second_org = uuid4()
+        payload = ContactCreate(
+            first_name="Jordan",
+            last_name="Lee",
+            title="Buyer",
+            linkedin_url="https://linkedin.com/in/jordan-lee",
+        )
+        first = create_contact(db, payload, organization_id=first_org)
+        second = create_contact(db, payload, organization_id=second_org)
+
+        assert first.id != second.id
+        assert list_contacts(db, 1, 50, search="Jordan", organization_id=first_org)[
+            "total"
+        ] == 1
+        assert list_contacts(db, 1, 50, search="Jordan", organization_id=second_org)[
+            "total"
+        ] == 1
+
+
+def test_contact_list_returns_one_row_and_searches_related_fields() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine, autoflush=False) as db:
+        brand = Brand(name="CASTRO", normalized_name="castro")
+        db.add(brand)
+        db.flush()
+        contact = create_contact(
+            db,
+            ContactCreate(
+                brand_id=brand.id,
+                first_name="Noa",
+                last_name="Horesh",
+                title="Senior Buyer",
+            ),
+        )
+        create_email(
+            db,
+            EmailCreate(contact_id=contact.id, brand_id=brand.id, address="noa@castro.example"),
+        )
+
+        assert list_contacts(db, 1, 50)["total"] == 1
+        for term in ("Noa", "Senior Buyer", "CASTRO", "noa@castro.example"):
+            result = list_contacts(db, 1, 50, search=term)
+            assert result["total"] == 1
+            assert result["items"][0]["id"] == str(contact.id)
+        assert list_contacts(db, 1, 50, search="not-present")["total"] == 0
 
 
 def test_bulk_archive_and_selected_email_export() -> None:
@@ -174,6 +293,50 @@ def test_brand_hierarchy_groups_contacts_and_emails_by_brand() -> None:
         assert item["email_count"] == 2
         assert item["contacts"][0]["emails"][0]["id"] == str(contact_email.id)
         assert item["brand_emails"][0]["id"] == str(generic_email.id)
+
+
+def test_brand_hierarchy_supports_contact_with_positions_at_multiple_brands() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as db:
+        first = Brand(name="First", normalized_name="first")
+        second = Brand(name="Second", normalized_name="second")
+        db.add_all([first, second])
+        db.flush()
+        contact = create_contact(
+            db,
+            ContactCreate(
+                brand_id=first.id,
+                first_name="Shared",
+                last_name="Buyer",
+                title="Buyer",
+            ),
+        )
+        db.add(
+            ContactPosition(
+                contact_id=contact.id,
+                brand_id=second.id,
+                title="Advisor",
+                is_current=True,
+            )
+        )
+        email = create_email(
+            db,
+            EmailCreate(contact_id=contact.id, address="shared@example.com"),
+        )
+        email.authenticity_level = "verified"
+        email.pool = EmailPool.valid
+        db.flush()
+
+        hierarchy = list_brand_hierarchy(db, 1, 50)
+        items = {item["name"]: item for item in hierarchy["items"]}
+
+        assert set(items) == {"First", "Second"}
+        for item in items.values():
+            assert item["contact_count"] == 1
+            assert item["contacts"][0]["is_valid"] is True
+            assert item["contacts"][0]["emails"][0]["id"] == str(email.id)
 
 
 def test_brand_list_reports_active_related_email_count() -> None:

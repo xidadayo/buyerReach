@@ -16,14 +16,13 @@
         <div class="nav-label">General</div>
           <el-menu router :default-active="route.path" background-color="#162230" text-color="#b7c4d2" active-text-color="#ffffff">
             <el-menu-item index="/">工作台</el-menu-item>
-            <el-menu-item index="/tasks">搜索任务</el-menu-item>
-            <el-menu-item index="/candidates">品牌候选池</el-menu-item>
-            <el-menu-item index="/data">客户数据中心</el-menu-item>
+            <el-menu-item v-if="auth.hasPermission('tasks:read')" index="/tasks">搜索任务</el-menu-item>
+            <el-menu-item v-if="hasDataAccess" index="/data">客户数据中心</el-menu-item>
           </el-menu>
         <div class="nav-label">Admin</div>
         <el-menu router :default-active="route.path" background-color="#162230" text-color="#b7c4d2" active-text-color="#ffffff">
-          <el-menu-item index="/review">审核与去重</el-menu-item>
-          <el-menu-item index="/settings">系统配置</el-menu-item>
+          <el-menu-item v-if="hasReviewAccess" index="/review">审核与去重</el-menu-item>
+          <el-menu-item v-if="hasSettingsAccess" index="/settings">系统配置</el-menu-item>
         </el-menu>
       </el-aside>
       <el-container>
@@ -56,7 +55,7 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
-            <el-button type="primary" @click="$router.push('/tasks')">创建任务</el-button>
+            <el-button v-if="auth.hasPermission('tasks:write')" type="primary" @click="$router.push('/tasks')">创建任务</el-button>
           </div>
         </el-header>
         <el-main>
@@ -87,6 +86,10 @@ const userInitial = computed(() => {
   const name = auth.state.user?.name || 'U'
   return name.charAt(0).toUpperCase()
 })
+
+const hasDataAccess = computed(() => auth.hasAnyPermission(['brands:read', 'contacts:read', 'emails:read']))
+const hasReviewAccess = computed(() => auth.hasAnyPermission(['import:execute', 'export:execute', 'dedup:execute', 'blacklist:read']))
+const hasSettingsAccess = computed(() => auth.hasAnyPermission(['settings:read', 'providers:read', 'roles:read', 'users:read', 'tags:read', 'custom_fields:read', 'audit:read']))
 
 async function doLogout() {
   await auth.logout()

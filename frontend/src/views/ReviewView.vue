@@ -1,8 +1,8 @@
 <template>
   <h1 class="page-title">审核与数据工具</h1>
 
-  <el-row :gutter="16">
-    <el-col :xs="24" :lg="12">
+  <el-row v-if="canImport || canExport" :gutter="16">
+    <el-col v-if="canImport" :xs="24" :lg="canExport ? 12 : 24">
       <div class="panel">
         <div class="panel-heading">
           <h3>导入数据</h3>
@@ -31,7 +31,7 @@
         </el-table>
       </div>
     </el-col>
-    <el-col :xs="24" :lg="12">
+    <el-col v-if="canExport" :xs="24" :lg="canImport ? 12 : 24">
       <div class="panel">
         <h3>导出数据</h3>
         <el-form inline style="margin-bottom: 12px">
@@ -39,7 +39,7 @@
           <el-form-item label="筛选值"><el-input v-model="exportFilterValue" placeholder="例如 valid" /></el-form-item>
         </el-form>
         <div class="button-grid">
-          <el-button v-for="item in exportOptions" :key="item.value" @click="download(item.value)">
+          <el-button v-for="item in visibleExportOptions" :key="item.value" @click="download(item.value)">
             {{ item.label }}
           </el-button>
         </div>
@@ -47,7 +47,7 @@
     </el-col>
   </el-row>
 
-  <div class="panel">
+  <div v-if="canDedup" class="panel">
     <div class="panel-heading">
       <h3>重复数据</h3>
       <el-button type="primary" :loading="checking" @click="check">执行检查</el-button>
@@ -98,10 +98,10 @@
     </template>
   </div>
 
-  <div class="panel">
+  <div v-if="canReadBlacklist" class="panel">
     <div class="panel-heading">
       <h3>禁止发送名单</h3>
-      <el-button @click="blacklistVisible = true">新增</el-button>
+      <el-button v-if="canWriteBlacklist" @click="blacklistVisible = true">新增</el-button>
     </div>
     <EntityTable ref="blacklistTable" endpoint="/blacklist" :columns="blacklistColumns" />
   </div>
@@ -124,9 +124,18 @@ import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 import { computed, reactive, ref } from 'vue'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
 import { api } from '../api/client'
+import { useAuth } from '../stores/auth'
+
+const auth = useAuth()
+const canImport = computed(() => auth.hasPermission('import:execute'))
+const canExport = computed(() => auth.hasPermission('export:execute'))
+const canDedup = computed(() => auth.hasPermission('dedup:execute'))
+const canReadBlacklist = computed(() => auth.hasPermission('blacklist:read'))
+const canWriteBlacklist = computed(() => auth.hasPermission('blacklist:write'))
 
 const entityOptions = [{ label: '品牌', value: 'brands' }, { label: '联系人', value: 'contacts' }, { label: '邮箱', value: 'emails' }]
 const exportOptions = [...entityOptions, { label: '搜索任务', value: 'tasks' }, { label: '审计日志', value: 'audit_logs' }]
+const visibleExportOptions = computed(() => exportOptions.filter((item) => item.value !== 'audit_logs' || auth.hasPermission('audit:read')))
 const importType = ref('brands')
 const file = ref<File | null>(null)
 const previewing = ref(false)

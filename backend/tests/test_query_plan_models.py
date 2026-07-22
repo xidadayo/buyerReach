@@ -306,7 +306,7 @@ def test_query_plan_model_creation() -> None:
         db.commit()
 
         plan = SearchQueryPlan(
-            task_id=str(task.id), version=1, status="draft",
+            task_id=task.id, version=1, status="draft",
             target_result_count=100,
         )
         db.add(plan)

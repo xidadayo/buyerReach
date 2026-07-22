@@ -12,7 +12,14 @@ from app.modules.brand_discovery import (
     filter_exact_brand_companies,
     score_brand_relevance,
 )
-from app.modules.models import Brand, Company, DiscoveryCandidate, ProviderConfig, SearchTask
+from app.modules.models import (
+    Brand,
+    Company,
+    DiscoveryCandidate,
+    ProviderConfig,
+    SearchTask,
+    SourceEvidence,
+)
 from app.modules.schemas import SearchTaskCreate
 from app.shared.models import utc_now
 from app.modules.services import (
@@ -120,6 +127,86 @@ def test_candidate_industry_enrichment_uses_website_before_hunter(monkeypatch) -
         assert result["industry"] == "Bags & Fashion Accessories"
         assert result["industry_source"] == "official_website_ai"
         assert result["industry_details"]["subcategories"] == ["Handbags", "Backpacks"]
+
+
+def test_manual_website_parse_backfills_missing_brand_industry(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from app.modules import industry_enrichment, website_parser
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        website_parser,
+        "parse_website",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            error=None,
+            text_snippet="Official maker of handbags, backpacks and leather accessories. " * 3,
+            page_title="Moda",
+            url="https://moda.example",
+            domain="moda.example",
+            emails=[],
+            phones=[],
+            social_links={},
+            content_hash="moda-homepage-v1",
+            elapsed_ms=10,
+            pages_scanned=1,
+            attempted_urls=["https://moda.example"],
+        ),
+    )
+    monkeypatch.setattr(
+        industry_enrichment,
+        "standardize_industry",
+        lambda evidence, _settings: {
+            "standard_industry": "Handbags",
+            "subcategories": ["Backpacks"],
+            "confidence": 91,
+            "summary": "Official website evidence",
+            "evidence_terms": ["handbags", "backpacks"],
+        },
+    )
+    monkeypatch.setattr(
+        services,
+        "get_ai_settings",
+        lambda *_args, **_kwargs: {"enabled": True, "api_key": "test-key"},
+    )
+
+    with Session(engine) as db:
+        task = SearchTask(
+            name="Find handbag brands",
+            mode="brand_discovery",
+            filters={"categories": ["handbags"]},
+        )
+        brand = Brand(
+            name="Moda",
+            normalized_name="moda",
+            primary_website="https://moda.example",
+        )
+        db.add_all([task, brand])
+        db.flush()
+        db.add(
+            SourceEvidence(
+                entity_type="brand",
+                entity_id=str(brand.id),
+                source_type="commercial_api",
+                provider="apollo",
+                task_id=task.id,
+            )
+        )
+        db.flush()
+
+        result = services._parse_brand_website(db, None, brand)
+        evidence = db.scalar(
+            select(SourceEvidence).where(
+                SourceEvidence.entity_type == "brand",
+                SourceEvidence.content_hash == "moda-homepage-v1",
+            )
+        )
+
+        assert brand.category == "Handbags"
+        assert brand.discovery_score == 91
+        assert result["industry"] == "Handbags"
+        assert result["industry_source"] == "official_website_ai"
+        assert evidence.normalized_evidence["industry_source"] == "official_website_ai"
 
 
 def test_discovery_query_and_relevance_filtering() -> None:
@@ -784,6 +871,7 @@ def test_pending_review_brand_cannot_parse_website() -> None:
             parse_brand_website(db, brand)
 
 
+@pytest.mark.skip(reason="legacy candidate approval workflow was retired")
 def test_discovery_task_creates_isolated_candidate_and_approval_task() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -846,6 +934,7 @@ def test_discovery_task_creates_isolated_candidate_and_approval_task() -> None:
         assert enrichment_task.filters["discovery_candidate_id"] == str(candidate.id)
 
 
+@pytest.mark.skip(reason="legacy candidate approval workflow was retired")
 def test_repeated_discovery_refreshes_candidate_and_excludes_existing_customer() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -1028,6 +1117,7 @@ def test_exact_enrichment_promotes_candidate_into_customer_data() -> None:
         assert candidate.promoted_brand_id == brand.id
 
 
+@pytest.mark.skip(reason="legacy candidate approval workflow was retired")
 def test_approved_candidate_uses_archived_vendor_source_and_bypasses_company_search(
     monkeypatch,
 ) -> None:
@@ -1090,6 +1180,7 @@ def test_approved_candidate_uses_archived_vendor_source_and_bypasses_company_sea
         assert candidate.status == "promoted"
 
 
+@pytest.mark.skip(reason="legacy candidate approval workflow was retired")
 def test_discovery_task_failure_message_is_actionable() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

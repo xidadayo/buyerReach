@@ -50,7 +50,7 @@ def _task(db: Session, **kw) -> SearchTask:
 
 def _plan(db: Session, task: SearchTask, **kw) -> SearchQueryPlan:
     p = SearchQueryPlan(
-        task_id=str(task.id), version=kw.pop("version", 1),
+        task_id=task.id, version=kw.pop("version", 1),
         status=kw.pop("status", "draft"),
         target_result_count=kw.pop("target_result_count", 100),
         organization_id=str(task.organization_id) if task.organization_id else None,
@@ -146,7 +146,7 @@ def test_lock_plan_writes_configuration_snapshot() -> None:
     task = _task(db)
     plan = _plan(db, task)
     _slice(db, plan, normalized_hash="h1")
-    result = lock_plan(db, plan, task)
+    lock_plan(db, plan, task)
     db.commit()
     db.refresh(task)
     assert "query_plan" in (task.configuration_snapshot or {})
@@ -238,7 +238,7 @@ def test_add_slice_rejects_duplicate_hash() -> None:
     # Create a slice with a known set of fields
     payload = QuerySliceCreate(label="first", purpose="core",
         countries=["IT"], target_concepts=["test"])
-    first = add_slice(db, plan, payload)
+    add_slice(db, plan, payload)
     db.commit()
     # Trying to add the same slice again
     with pytest.raises(ValueError, match="Duplicate slice"):

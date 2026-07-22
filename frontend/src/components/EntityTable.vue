@@ -57,12 +57,14 @@ export interface TableColumn {
 const props = withDefaults(defineProps<{
   endpoint: string
   columns: TableColumn[]
+  queryParams?: Record<string, unknown>
   pageSize?: number
   selectable?: boolean
   tableMaxHeight?: string | number
   scrollbarAlwaysOn?: boolean
 }>(), {
   pageSize: 50,
+  queryParams: () => ({}),
   selectable: false,
   tableMaxHeight: undefined,
   scrollbarAlwaysOn: false,
@@ -77,7 +79,9 @@ const page = ref(1)
 async function load() {
   loading.value = true
   try {
-    const { data } = await api.get(props.endpoint, { params: { page: page.value, page_size: props.pageSize } })
+    const { data } = await api.get(props.endpoint, {
+      params: { ...props.queryParams, page: page.value, page_size: props.pageSize },
+    })
     items.value = data.items || []
     total.value = data.total || 0
   } catch (error) {
@@ -97,6 +101,11 @@ function handleSelectionChange(rows: Record<string, any>[]) {
   emit('selection-change', rows)
 }
 
-defineExpose({ load })
+async function reloadFromFirstPage() {
+  page.value = 1
+  await load()
+}
+
+defineExpose({ load, reloadFromFirstPage })
 onMounted(load)
 </script>

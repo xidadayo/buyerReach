@@ -35,6 +35,7 @@ __pycache__/
 # OS/editor files
 .DS_Store
 Thumbs.db
+~$*.docx
 
 # Accidental local artifacts
 /80041adapter80041

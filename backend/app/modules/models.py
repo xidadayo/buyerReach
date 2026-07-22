@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, cast, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -87,6 +87,19 @@ class ContactPosition(UUIDMixin, TimestampMixin, SoftDeleteMixin, ExternalRefMix
     priority: Mapped[int] = mapped_column(Integer, default=0)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    __table_args__ = (
+        Index(
+            "uq_contact_position_active_identity",
+            "contact_id",
+            func.coalesce(cast(company_id, String), ""),
+            func.coalesce(cast(brand_id, String), ""),
+            func.lower(func.trim(title)),
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
 
 class EmailAddress(UUIDMixin, TimestampMixin, SoftDeleteMixin, OwnershipMixin, ExternalRefMixin, Base):
     contact_id: Mapped[str | None] = mapped_column(ForeignKey("contact.id"), nullable=True)
@@ -142,6 +155,16 @@ class SourceEvidence(UUIDMixin, TimestampMixin, ExternalRefMixin, Base):
     excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[int] = mapped_column(Integer, default=0)
     content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("search_task.id"), nullable=True, index=True)
+    stage_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("pipeline_stage_run.id"), nullable=True, index=True
+    )
+    vendor_request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_record_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    adapter_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    observed_at: Mapped[str | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    normalized_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class SearchTask(UUIDMixin, TimestampMixin, OwnershipMixin, Base):
@@ -649,4 +672,82 @@ class SchedulerCapacityLease(UUIDMixin, TimestampMixin, Base):
             name="uq_capacity_lease_scope_holder",
         ),
         Index("ix_capacity_lease_expires", "lease_expires_at"),
+    )
+
+
+# ── Batch Exact Brand (additive, 2026-07-22) ────────────────────────────────
+
+
+class BatchImport(UUIDMixin, TimestampMixin, Base):
+    """A single uploaded file of companies for batch exact-brand search."""
+
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organization.id"), nullable=True, index=True
+    )
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    template_version: Mapped[str] = mapped_column(String(40), default="exact-brand-import-v1")
+    file_hash: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(40), default="uploaded", index=True)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0)
+    valid_rows: Mapped[int] = mapped_column(Integer, default=0)
+    warning_rows: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_rows: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_rows: Mapped[int] = mapped_column(Integer, default=0)
+    error_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    parsed_preview: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    parent_task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("search_task.id"), nullable=True, index=True
+    )
+    confirmed_at: Mapped[str | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    targets: Mapped[list["ExactBrandTarget"]] = relationship(back_populates="batch_import")
+
+
+class ExactBrandTarget(UUIDMixin, TimestampMixin, Base):
+    """A single company-domain row within a batch import — independently executed."""
+
+    batch_import_id: Mapped[str] = mapped_column(
+        ForeignKey("batch_import.id"), nullable=False
+    )
+    search_task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("search_task.id"), nullable=True, index=True
+    )
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organization.id"), nullable=True, index=True
+    )
+    row_number: Mapped[int] = mapped_column(Integer)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company_name: Mapped[str] = mapped_column(String(500))
+    normalized_company_name: Mapped[str] = mapped_column(String(500))
+    official_domain: Mapped[str] = mapped_column(String(500))
+    normalized_domain: Mapped[str] = mapped_column(String(255), index=True)
+    country: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_input: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation_status: Mapped[str] = mapped_column(String(40), default="pending")
+    validation_errors: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    execution_status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    current_stage: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    brand_id: Mapped[str | None] = mapped_column(
+        ForeignKey("brand.id"), nullable=True
+    )
+    contact_count: Mapped[int] = mapped_column(Integer, default=0)
+    reliable_email_count: Mapped[int] = mapped_column(Integer, default=0)
+    review_email_count: Mapped[int] = mapped_column(Integer, default=0)
+    vendor_results: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    execution_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_expires_at: Mapped[str | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+    batch_import: Mapped[BatchImport | None] = relationship(back_populates="targets")
+
+    __table_args__ = (
+        UniqueConstraint("batch_import_id", "row_number", name="uq_target_batch_row"),
+        UniqueConstraint("batch_import_id", "normalized_domain", name="uq_target_batch_domain"),
     )

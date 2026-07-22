@@ -1,472 +1,487 @@
-"""Per-vendor independent pipeline execution.
+"""Task-frozen Apollo/Hunter execution for company-to-email workflows.
 
-Each vendor's pipeline runs from company search through contact/email discovery.
-Pipelines are independent — one vendor's failure does not affect another's results.
-All calls go through existing `execute_provider()`, `enabled_providers()` etc.
+Vendor protocol remains in the versioned adapters.  This module only applies
+the task plan, keeps company/contact scope intact, and persists normalized
+results through the existing domain services.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.modules.brand_discovery import filter_discovery_companies, filter_exact_brand_companies
 from app.modules.models import (
-    Brand,
-    Company,
-    Contact,
-    ContactPosition,
-    EmailAddress,
+    PipelineStageRun,
     ProviderConfig,
     SearchTask,
-    TaskItem,
+    SourceEvidence,
     TaskVendorPlan,
 )
+from app.modules.schemas import BrandCreate, ContactCreate, EmailCreate
 from app.modules.services import (
-    _candidate_matches_customer,
-    _record_provider_fallback,
+    _apply_provider_verification,
+    _ensure_email_verified,
     _record_task_result,
+    _title_matches_targets,
+    create_brand,
+    create_contact,
+    create_email,
     enabled_providers,
     execute_provider_waterfall,
-    ensure_task_vendor_plan,
-    record_usage,
-    to_dict,
+    get_or_create_company,
 )
-from app.providers.base import ProviderResult
-from app.providers.local import slugify
-from app.shared.enums import EmailPool, EmailStatus, TaskStatus
+from app.shared.enums import SourceType, TaskStatus
 from app.shared.models import utc_now
 
 
 @dataclass
 class PipelineStageResult:
-    """Result of one stage within a vendor's pipeline."""
     stage: str
     vendor: str
     ok: bool
     items: list[dict[str, Any]] = field(default_factory=list)
-    raw_count: int = 0
     error_code: str | None = None
     error_message: str | None = None
-    cost: float = 0.0
-    vendor_request_id: str | None = None
+
+
+@dataclass
+class CompanyPipelineResult:
+    company: dict[str, Any]
+    contacts: list[dict[str, Any]] = field(default_factory=list)
+    emails: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class VendorPipelineResult:
-    """Complete result of one vendor's full pipeline execution."""
     vendor: str
     ok: bool
-    companies: list[dict[str, Any]] = field(default_factory=list)
-    contacts: list[dict[str, Any]] = field(default_factory=list)
-    emails: list[dict[str, Any]] = field(default_factory=list)
+    companies: list[CompanyPipelineResult] = field(default_factory=list)
     stages: list[PipelineStageResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    total_cost: float = 0.0
     provider_config: ProviderConfig | None = None
+    stage_run: PipelineStageRun | None = None
+
+
+def _provider_vendor(provider: ProviderConfig) -> str:
+    config = provider.config if isinstance(provider.config, dict) else {}
+    return str(config.get("adapter") or provider.provider.partition("-")[0]).casefold()
+
+
+def _provider_for(db: Session, task: SearchTask, provider_type: str, vendor: str) -> ProviderConfig | None:
+    return next(
+        (
+            provider
+            for provider in enabled_providers(db, provider_type, task)
+            if _provider_vendor(provider) == vendor
+        ),
+        None,
+    )
+
+
+def _company_filter(task: SearchTask, filters: dict[str, Any] | None = None):
+    effective_filters = filters or task.filters
+    if task.mode == "exact_brand" or effective_filters.get("mode") == "exact_brand":
+        return lambda items: filter_exact_brand_companies(items, effective_filters)
+    return lambda items: filter_discovery_companies(items, effective_filters)
 
 
 def execute_vendor_pipeline(
     db: Session,
     task: SearchTask,
     vendor: str,
+    *,
+    filters: dict[str, Any] | None = None,
 ) -> VendorPipelineResult:
-    """Execute one vendor's complete pipeline: company → contact → email.
-
-    Returns a structured result; errors are collected, not raised.
-    Single-stage failures do not abort the pipeline.
-    """
+    """Run one selected Vendor without falling through to another Vendor."""
+    effective_filters = filters or task.filters
     result = VendorPipelineResult(vendor=vendor, ok=False)
-    filters = task.filters if isinstance(task.filters, dict) else {}
-
-    # ── Resolve the vendor's company_search provider ──────────────────────
-    company_providers = [
-        p for p in enabled_providers(db, "company_search", task)
-        if _vendor_matches(p, vendor)
-    ]
-    if not company_providers:
-        result.errors.append(f"{vendor}: no enabled company_search provider")
+    company_provider = _provider_for(db, task, "company_search", vendor)
+    if company_provider is None:
+        result.errors.append(f"{vendor}: no frozen company_search provider is available")
         return result
-
-    company_provider = company_providers[0]
     result.provider_config = company_provider
 
-    # ── Stage 1: Company Search ──────────────────────────────────────────
-    company_stage = _execute_company_search(db, task, company_provider, vendor, filters)
+    provider, companies, errors = execute_provider_waterfall(
+        db,
+        "company_search",
+        effective_filters,
+        "companies",
+        task=task,
+        entity_type="company",
+        item_filter=_company_filter(task, effective_filters),
+        allowed_vendors={vendor},
+    )
+    company_stage = PipelineStageResult(
+        stage="company_search",
+        vendor=vendor,
+        ok=provider is not None,
+        items=companies,
+        error_code=None if provider is not None else "company_search_failed",
+        error_message="; ".join(errors) or None,
+    )
     result.stages.append(company_stage)
-    result.total_cost += company_stage.cost
-    if not company_stage.ok:
-        result.errors.append(f"{vendor} company_search: {company_stage.error_message}")
-        return result  # No companies → pipeline cannot continue
-
-    companies = company_stage.items
-    if not companies:
-        result.ok = True  # Successfully searched, no results found
+    if provider is None:
+        result.errors.extend(errors or [f"{vendor}: company search failed"])
         return result
 
-    result.companies = companies
-
-    # ── Stage 2: Contact Search ──────────────────────────────────────────
-    target_titles = list(filters.get("target_titles") or [])
-    if vendor == "apollo":
-        contact_stage = _execute_apollo_contact_search(
-            db, task, companies, target_titles, vendor
+    limit = max(int(effective_filters.get("brand_limit") or 100), 0)
+    for company in companies[:limit]:
+        if task.status in {TaskStatus.cancelled, TaskStatus.paused}:
+            break
+        scoped = CompanyPipelineResult(company=company)
+        scoped.contacts = _search_contacts(
+            db, task, vendor, company, result, filters=effective_filters
         )
-    else:
-        contact_stage = _execute_hunter_contact_search(
-            db, task, companies, target_titles, vendor
-        )
-    result.stages.append(contact_stage)
-    result.total_cost += contact_stage.cost
-    if contact_stage.ok:
-        result.contacts = contact_stage.items
-    elif contact_stage.error_code not in {"no_results", "no_mapped_contacts"}:
-        result.errors.append(f"{vendor} contact_search: {contact_stage.error_message}")
-
-    # ── Stage 3: Email Discovery ─────────────────────────────────────────
-    if result.contacts:
-        email_stage = _execute_email_discovery(
-            db, task, companies, result.contacts, vendor
-        )
-        result.stages.append(email_stage)
-        result.total_cost += email_stage.cost
-        if email_stage.ok:
-            result.emails = email_stage.items
-        if not email_stage.ok and email_stage.error_code != "no_email_returned":
-            result.errors.append(f"{vendor} email: {email_stage.error_message}")
+        scoped.emails = _discover_emails(db, task, vendor, company, scoped.contacts, result)
+        result.companies.append(scoped)
 
     result.ok = True
     return result
 
 
-# ── Private stage implementations ────────────────────────────────────────────
+def _search_contacts(
+    db: Session,
+    task: SearchTask,
+    vendor: str,
+    company: dict[str, Any],
+    pipeline: VendorPipelineResult,
+    *,
+    filters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    effective_filters = filters or task.filters
+    provider, contacts, errors = execute_provider_waterfall(
+        db,
+        "contact_search",
+        {
+            "operation": "contact_search",
+            "company": company,
+            "domain": company.get("domain") or "",
+            "titles": list(effective_filters.get("target_titles") or []),
+            "limit": int(effective_filters.get("contacts_limit_per_brand") or 5),
+        },
+        "contacts",
+        task=task,
+        entity_type="contact",
+        allowed_vendors={vendor},
+    )
+    if provider is None:
+        pipeline.stages.append(
+            PipelineStageResult(
+                stage="contact_search",
+                vendor=vendor,
+                ok=False,
+                error_code="no_results" if not errors else "contact_search_failed",
+                error_message="; ".join(errors) or "No contacts returned",
+            )
+        )
+        return []
+
+    if vendor == "apollo" and contacts:
+        from app.modules.services import _enrich_contacts_with_apollo
+
+        contacts = _enrich_contacts_with_apollo(db, task, provider, company, contacts)
+    contacts = _filter_contacts_for_titles(
+        contacts, list(effective_filters.get("target_titles") or [])
+    )
+    pipeline.stages.append(
+        PipelineStageResult(stage="contact_search", vendor=vendor, ok=True, items=contacts)
+    )
+    return contacts[: int(effective_filters.get("contacts_limit_per_brand") or 5)]
 
 
-def _vendor_matches(provider: ProviderConfig, vendor: str) -> bool:
-    """Check if a provider belongs to *vendor* (e.g. 'apollo-contact-search' matches 'apollo')."""
-    return (
-        provider.provider == vendor
-        or provider.provider.startswith(f"{vendor}-")
-        or str(provider.provider).partition("-")[0] == vendor
+def _filter_contacts_for_titles(
+    contacts: list[dict[str, Any]], target_titles: list[str]
+) -> list[dict[str, Any]]:
+    return [
+        contact
+        for contact in contacts
+        if _title_matches_targets(str(contact.get("title") or ""), target_titles)
+    ]
+
+
+def _contact_key(contact: dict[str, Any]) -> str:
+    provider_id = str(contact.get("provider_person_id") or "").strip()
+    if provider_id:
+        return f"provider:{provider_id}"
+    linkedin = str(contact.get("linkedin_url") or "").strip().casefold()
+    if linkedin:
+        return f"linkedin:{linkedin}"
+    return "name:" + "|".join(
+        str(contact.get(key) or "").strip().casefold()
+        for key in ("first_name", "last_name", "title")
     )
 
 
-def _execute_company_search(
+def _discover_emails(
     db: Session,
     task: SearchTask,
-    provider: ProviderConfig,
     vendor: str,
-    filters: dict,
-) -> PipelineStageResult:
-    try:
-        prov, items, errors = execute_provider_waterfall(
+    company: dict[str, Any],
+    contacts: list[dict[str, Any]],
+    pipeline: VendorPipelineResult,
+) -> list[dict[str, Any]]:
+    emails: list[dict[str, Any]] = []
+    for contact in contacts:
+        details_by_address = {
+            str(item.get("address") or "").strip().casefold(): item
+            for item in contact.get("email_details") or []
+            if isinstance(item, dict) and str(item.get("address") or "").strip()
+        }
+        addresses = list(contact.get("emails") or [])
+        if contact.get("email"):
+            addresses.append(contact["email"])
+        for address in dict.fromkeys(str(value).strip() for value in addresses if str(value).strip()):
+            evidence = details_by_address.get(address.casefold(), {})
+            emails.append(
+                {
+                    "address": address,
+                    "contact_key": _contact_key(contact),
+                    **{
+                        key: evidence[key]
+                        for key in (
+                            "verification_status",
+                            "verification_source",
+                            "verification_provider",
+                        )
+                        if evidence.get(key)
+                    },
+                }
+            )
+
+        if vendor != "hunter" or addresses:
+            continue
+        provider, items, _ = execute_provider_waterfall(
             db,
-            "company_search",
+            "email_finder",
             {
-                "operation": "company_search",
-                "brand_keywords": filters.get("brand_keywords", []),
-                "official_domains": filters.get("official_domains", []),
-                "countries": filters.get("countries", []),
-                "categories": filters.get("categories", []),
-                "mode": task.mode,
+                "contact": contact,
+                "domain": company.get("domain") or "",
+                "first_name": contact.get("first_name"),
+                "last_name": contact.get("last_name"),
             },
-            "companies",
+            "emails",
             task=task,
-            entity_type="company",
+            entity_type="email",
+            allowed_vendors={vendor},
         )
-        if prov is None:
-            msg = "; ".join(errors) if errors else f"No enabled {vendor} company_search provider"
-            return PipelineStageResult(
-                stage="company_search", vendor=vendor, ok=False,
-                error_code="no_provider", error_message=msg,
-            )
-        raw_count = len(items)
-        return PipelineStageResult(
-            stage="company_search", vendor=vendor, ok=True,
-            items=items, raw_count=raw_count,
-        )
-    except Exception as exc:
-        return PipelineStageResult(
-            stage="company_search", vendor=vendor, ok=False,
-            error_code="exception", error_message=str(exc)[:2000],
-        )
+        if provider is not None:
+            for item in items:
+                address = str(item.get("address") or item.get("email") or "").strip()
+                if address:
+                    emails.append({"address": address, "contact_key": _contact_key(contact)})
 
-
-def _execute_apollo_contact_search(
-    db: Session,
-    task: SearchTask,
-    companies: list[dict],
-    target_titles: list[str],
-    vendor: str,
-) -> PipelineStageResult:
-    contacts: list[dict] = []
-    for company in companies:
-        domain = company.get("domain") or ""
-        try:
-            prov, items, errors = execute_provider_waterfall(
-                db,
-                "contact_search",
-                {
-                    "operation": "contact_search",
-                    "company": company,
-                    "domain": domain,
-                    "titles": target_titles,
-                    "limit": int(task.filters.get("contacts_limit_per_brand") or 5),
-                },
-                "contacts",
-                task=task,
-                entity_type="contact",
-            )
-            if prov is None or not items:
-                continue
-            # Apollo people search returns contacts; run bulk enrichment
-            enriched = _apollo_bulk_enrich(db, task, prov, company, items)
-            contacts.extend(enriched)
-        except Exception:
-            continue
-
-    if not contacts:
-        return PipelineStageResult(
-            stage="contact_search", vendor=vendor, ok=False,
-            error_code="no_mapped_contacts", error_message="no mapped contacts returned",
+    deduped = list({(item["address"].casefold(), item["contact_key"]): item for item in emails}.values())
+    pipeline.stages.append(
+        PipelineStageResult(
+            stage="email_discovery",
+            vendor=vendor,
+            ok=True,
+            items=deduped,
+            error_code=None if deduped else "no_email_returned",
+            error_message=None if deduped else f"{vendor} returned no email addresses",
         )
-    return PipelineStageResult(
-        stage="contact_search", vendor=vendor, ok=True,
-        items=contacts, raw_count=len(contacts),
     )
-
-
-def _apollo_bulk_enrich(
-    db: Session,
-    task: SearchTask,
-    provider: ProviderConfig,
-    company: dict,
-    contacts: list[dict],
-) -> list[dict]:
-    """Run Apollo bulk_match to enrich contacts with emails/phones."""
-    from app.core.crypto import decrypt_provider_config
-    from app.modules.services import _enrich_contacts_with_apollo
-
-    config = decrypt_provider_config(provider.config or {})
-    if (
-        str(config.get("adapter") or "").lower() != "apollo"
-        or not str(config.get("bulk_enrichment_endpoint_url") or "").strip()
-    ):
-        return contacts
-    try:
-        enriched = _enrich_contacts_with_apollo(db, task, provider, company, contacts)
-        return enriched
-    except Exception:
-        return contacts
-
-
-def _execute_hunter_contact_search(
-    db: Session,
-    task: SearchTask,
-    companies: list[dict],
-    target_titles: list[str],
-    vendor: str,
-) -> PipelineStageResult:
-    contacts: list[dict] = []
-    for company in companies:
-        domain = company.get("domain") or ""
-        try:
-            prov, items, errors = execute_provider_waterfall(
-                db,
-                "contact_search",
-                {
-                    "company": company,
-                    "domain": domain,
-                    "titles": target_titles,
-                    "limit": int(task.filters.get("contacts_limit_per_brand") or 5),
-                },
-                "contacts",
-                task=task,
-                entity_type="contact",
-            )
-            if prov is None or not items:
-                continue
-            contacts.extend(items)
-        except Exception:
-            continue
-
-    if not contacts:
-        return PipelineStageResult(
-            stage="contact_search", vendor=vendor, ok=False,
-            error_code="no_results", error_message="Hunter Domain Search returned no contacts",
-        )
-    return PipelineStageResult(
-        stage="contact_search", vendor=vendor, ok=True,
-        items=contacts, raw_count=len(contacts),
-    )
-
-
-def _execute_email_discovery(
-    db: Session,
-    task: SearchTask,
-    companies: list[dict],
-    contacts: list[dict],
-    vendor: str,
-) -> PipelineStageResult:
-    """Discover emails. Apollo contacts already carry emails from search/enrichment.
-    Hunter contacts need email_finder calls."""
-    emails: list[dict] = []
-
-    if vendor == "apollo":
-        # Apollo contacts already have emails from people search or bulk_match
-        for contact in contacts:
-            contact_emails = contact.get("emails", [])
-            email_addr = contact.get("email")
-            if email_addr:
-                contact_emails.append(email_addr)
-            for addr in set(contact_emails):
-                if addr:
-                    emails.append({"address": str(addr), "contact": contact, "vendor": vendor})
-        if not emails:
-            return PipelineStageResult(
-                stage="email_discovery", vendor=vendor, ok=False,
-                error_code="no_email_returned",
-                error_message="Apollo returned no email addresses for contacts",
-            )
-    else:
-        # Hunter: call email_finder for each contact, then domain search for brands without contacts
-        for company in companies:
-            domain = company.get("domain") or ""
-            for contact in contacts:
-                try:
-                    prov, items, errors = execute_provider_waterfall(
-                        db,
-                        "email_finder",
-                        {
-                            "contact": contact,
-                            "domain": domain,
-                            "first_name": contact.get("first_name"),
-                            "last_name": contact.get("last_name"),
-                        },
-                        "emails",
-                        task=task,
-                        entity_type="email",
-                    )
-                    if prov is not None and items:
-                        for item in items:
-                            addr = item.get("address") or item.get("email")
-                            if addr:
-                                emails.append(
-                                    {"address": str(addr), "contact": contact, "vendor": vendor}
-                                )
-                except Exception:
-                    continue
-        if not emails:
-            return PipelineStageResult(
-                stage="email_discovery", vendor=vendor, ok=False,
-                error_code="no_email_returned",
-                error_message="Hunter Email Finder returned no emails",
-            )
-
-    return PipelineStageResult(
-        stage="email_discovery", vendor=vendor, ok=True,
-        items=emails, raw_count=len(emails),
-    )
-
-
-# ── Top-level pipeline mode orchestrator ─────────────────────────────────────
+    return deduped
 
 
 def execute_pipeline_mode(
     db: Session,
     task: SearchTask,
     plan: TaskVendorPlan,
-) -> tuple[list[dict], list[str], str | None]:
-    """Execute selected vendors' pipelines sequentially.
-
-    Returns (all_companies, all_errors, primary_provider_name).
-    Each vendor's results are persisted independently via the existing ingestion
-    functions. Cross-vendor dedup is handled by DiscoveryCandidate.dedupe_key.
-    """
-    selected = list(plan.selected_vendors or [])
-    if not selected:
-        return [], ["No vendors selected for pipeline execution"], None
-
-    all_companies: list[dict] = []
+) -> tuple[list[dict[str, Any]], list[str], str | None]:
+    """Execute and durably commit each selected Vendor independently."""
+    all_companies: list[dict[str, Any]] = []
     all_errors: list[str] = []
-    primary_provider_name: str | None = None
+    primary: str | None = None
 
-    for vendor in selected:
+    for vendor in list(plan.selected_vendors or []):
         if task.status in {TaskStatus.cancelled, TaskStatus.paused}:
             break
+        from app.pipeline.runner import begin_stage, complete_stage, fail_stage
 
-        pipeline_result = execute_vendor_pipeline(db, task, vendor)
+        stage_run = begin_stage(
+            db,
+            task.id,
+            "provider_search",
+            {"vendor": vendor, "mode": task.mode, "filters": task.filters},
+        )
+        result = execute_vendor_pipeline(db, task, vendor)
+        result.stage_run = stage_run
+        all_errors.extend(result.errors)
+        if result.ok:
+            complete_stage(
+                stage_run,
+                {
+                    "vendor": vendor,
+                    "accepted_company_count": len(result.companies),
+                    "stage_count": len(result.stages),
+                },
+            )
+        else:
+            fail_stage(
+                stage_run,
+                RuntimeError("; ".join(result.errors) or f"{vendor} pipeline failed"),
+                retryable=True,
+            )
+        if result.companies:
+            primary = primary or vendor
+            all_companies.extend(item.company for item in result.companies)
+            _persist_vendor_result(db, task, result)
+            # A later Vendor failure must not roll back this Vendor's accepted results.
+            db.commit()
+            db.refresh(task)
 
-        if pipeline_result.companies:
-            all_companies.extend(pipeline_result.companies)
-            if primary_provider_name is None:
-                primary_provider_name = vendor
-
-        all_errors.extend(pipeline_result.errors)
-
-        # ── Persist contacts and emails from this pipeline ────────────────
-        if pipeline_result.contacts or pipeline_result.emails:
-            _persist_pipeline_contacts_and_emails(db, task, pipeline_result)
-
-    return all_companies, all_errors, primary_provider_name
+    return _dedupe_companies(all_companies), all_errors, primary
 
 
-def _persist_pipeline_contacts_and_emails(
-    db: Session,
-    task: SearchTask,
-    result: VendorPipelineResult,
-) -> None:
-    """Create Contact, ContactPosition, EmailAddress from a pipeline result."""
-    from app.modules.services import create_brand, create_contact, create_email
+def _dedupe_companies(companies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for company in companies:
+        domain = str(company.get("domain") or company.get("website") or "").strip().casefold()
+        name = str(company.get("brand_name") or company.get("name") or "").strip().casefold()
+        country = str(company.get("country") or "").strip().casefold()
+        key = f"domain:{domain}" if domain else f"name:{name}|country:{country}"
+        deduped.setdefault(key, company)
+    return list(deduped.values())
 
-    for company in result.companies[:]:
-        brand_name = str(company.get("brand_name") or company.get("name") or "").strip()
+
+def _persist_vendor_result(
+    db: Session, task: SearchTask, result: VendorPipelineResult
+) -> dict[str, set[str]]:
+    persisted = {"brand_ids": set(), "contact_ids": set(), "email_ids": set()}
+    for scoped in result.companies:
+        company_payload = scoped.company
+        brand_name = str(company_payload.get("brand_name") or company_payload.get("name") or "").strip()
         if not brand_name:
             continue
-
-        # Create or find Company
-        from app.modules.services import get_or_create_company
-        comp = get_or_create_company(db, company)
-
-        # Create Brand
-        from app.modules.schemas import BrandCreate
+        company = get_or_create_company(db, company_payload)
         brand = create_brand(
             db,
             BrandCreate(
                 name=brand_name,
-                website=company.get("website") or company.get("domain"),
-                country=company.get("country"),
-                category=company.get("category"),
+                company_name=company.legal_name,
+                website=company_payload.get("website") or company_payload.get("domain"),
+                country=company_payload.get("country"),
+                category=company_payload.get("category"),
             ),
-            company=comp,
+            company=company,
+            source_type=SourceType.commercial_api,
             provider=result.vendor,
+            source_url=company_payload.get("source_url"),
+            source_title=company_payload.get("source_title"),
+            source_excerpt=company_payload.get("source_excerpt"),
+            discovery_score=int(company_payload.get("relevance_score") or 0),
         )
+        _record_task_result(db, task, "brand", brand.id, "brand_discovered", result.vendor)
+        _record_source(
+            db, task, "brand", brand.id, result.vendor, company_payload, result.stage_run
+        )
+        persisted["brand_ids"].add(str(brand.id))
 
-        # Create contacts for this company
-        for contact_payload in result.contacts:
+        contact_by_key: dict[str, Any] = {}
+        for payload in scoped.contacts:
+            first_name = str(payload.get("first_name") or "").strip()
+            title = str(payload.get("title") or "").strip()
+            if not first_name or not title:
+                continue
             contact = create_contact(
                 db,
                 ContactCreate(
                     brand_id=brand.id,
-                    company_id=comp.id,
-                    first_name=str(contact_payload.get("first_name") or ""),
-                    last_name=str(contact_payload.get("last_name") or ""),
-                    title=str(contact_payload.get("title") or ""),
-                    linkedin_url=contact_payload.get("linkedin_url"),
+                    company_id=company.id,
+                    first_name=first_name,
+                    last_name=str(payload.get("last_name") or ""),
+                    title=title,
+                    linkedin_url=payload.get("linkedin_url"),
                 ),
                 provider=result.vendor,
+                organization_id=task.organization_id,
             )
-            # Create emails for this contact
-            for email_payload in result.emails:
-                if email_payload.get("contact") == contact_payload:
-                    create_email(
-                        db,
-                        EmailCreate(
-                            contact_id=contact.id,
-                            address=email_payload["address"],
-                        ),
-                        provider=result.vendor,
-                    )
+            contact_by_key[_contact_key(payload)] = contact
+            _record_task_result(db, task, "contact", contact.id, "contact_discovered", result.vendor)
+            _record_source(
+                db, task, "contact", contact.id, result.vendor, payload, result.stage_run
+            )
+            persisted["contact_ids"].add(str(contact.id))
+
+        for payload in scoped.emails:
+            contact = contact_by_key.get(str(payload.get("contact_key") or ""))
+            if contact is None:
+                continue
+            try:
+                email = create_email(
+                    db,
+                    EmailCreate(contact_id=contact.id, brand_id=brand.id, address=payload["address"]),
+                    provider=result.vendor,
+                )
+            except (ValueError, IndexError):
+                continue
+            _record_task_result(db, task, "email", email.id, "email_discovered", result.vendor)
+            _record_source(
+                db, task, "email", email.id, result.vendor, payload, result.stage_run
+            )
+            _apply_provider_verification(db, email, payload, result.vendor)
+            _ensure_email_verified(db, email, task=task)
+            persisted["email_ids"].add(str(email.id))
+    return persisted
+
+
+def _record_source(
+    db: Session,
+    task: SearchTask,
+    entity_type: str,
+    entity_id,
+    vendor: str,
+    payload: dict[str, Any],
+    stage_run: PipelineStageRun | None,
+) -> None:
+    safe_payload = {
+        key: value
+        for key, value in payload.items()
+        if key.casefold() not in {"api_key", "authorization", "token", "password", "secret"}
+    }
+    canonical = json.dumps(safe_payload, sort_keys=True, default=str, separators=(",", ":"))
+    content_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    exists = db.scalar(
+        select(SourceEvidence.id).where(
+            SourceEvidence.entity_type == entity_type,
+            SourceEvidence.entity_id == str(entity_id),
+            SourceEvidence.provider == vendor,
+            SourceEvidence.content_hash == content_hash,
+        )
+    )
+    if exists is not None:
+        return
+    plan = db.scalar(select(TaskVendorPlan).where(TaskVendorPlan.task_id == task.id))
+    route = (
+        (plan.vendor_routes or {}).get(vendor, {})
+        if plan is not None and isinstance(plan.vendor_routes, dict)
+        else {}
+    )
+    db.add(
+        SourceEvidence(
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            source_type=SourceType.commercial_api,
+            provider=vendor,
+            title=f"{vendor} {entity_type} result",
+            content_hash=content_hash,
+            task_id=task.id,
+            stage_run_id=stage_run.id if stage_run is not None else None,
+            provider_record_id=str(payload.get("provider_person_id") or payload.get("id") or "") or None,
+            vendor_request_id=(
+                str(payload.get("vendor_request_id") or "")
+                or (stage_run.vendor_request_id if stage_run is not None else None)
+            ),
+            adapter_version=str(route.get("adapter_version") or "") or None,
+            input_hash=stage_run.input_hash if stage_run is not None else content_hash,
+            observed_at=utc_now(),
+            normalized_evidence=safe_payload,
+        )
+    )

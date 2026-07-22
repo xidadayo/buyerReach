@@ -61,7 +61,9 @@ class RequirePermission:
                 role_name = role.name
         permissions = get_role_permissions(role_name)
         if role:
-            permissions = permissions | _flatten_permissions(role.permissions or {})
+            from app.core.security import flatten_permissions
+
+            permissions = permissions | flatten_permissions(role.permissions or {})
         if "admin:*" not in permissions and self.permission not in permissions:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
         return user
@@ -69,16 +71,6 @@ class RequirePermission:
 
 def require_permission(permission: str):
     return Depends(RequirePermission(permission))
-
-
-def _flatten_permissions(value: dict) -> set[str]:
-    permissions: set[str] = set()
-    for resource, actions in value.items():
-        if isinstance(actions, list):
-            permissions.update(f"{resource}:{action}" for action in actions)
-        elif isinstance(actions, str):
-            permissions.add(f"{resource}:{actions}")
-    return permissions
 
 
 # ── Organization-scoped task authorization ───────────────────────────────────

@@ -171,7 +171,32 @@ def list_search_tasks(
         .offset((page - 1) * page_size)
         .limit(page_size)
     ).all()
-    return page_result(total, page, page_size, [to_dict(item) for item in items])
+    result = [to_dict(item) for item in items]
+
+    # Enrich batch tasks with target progress
+    for i, item in enumerate(items):
+        if item.mode == "batch_exact_brand":
+            from app.modules.models import ExactBrandTarget
+            targets = list(
+                db.scalars(
+                    select(ExactBrandTarget).where(
+                        ExactBrandTarget.search_task_id == str(item.id)
+                    )
+                ).all()
+            )
+            batch_progress = {
+                "targets_total": len(targets),
+                "targets_completed": sum(1 for t in targets if t.execution_status == "completed"),
+                "targets_running": sum(1 for t in targets if t.execution_status == "running"),
+                "targets_pending": sum(1 for t in targets if t.execution_status in ("pending", "queued")),
+                "targets_no_match": sum(1 for t in targets if t.execution_status == "no_match"),
+                "targets_failed": sum(1 for t in targets if t.execution_status in ("failed", "retryable")),
+                "targets_cancelled": sum(1 for t in targets if t.execution_status == "cancelled"),
+                "total_reliable_emails": sum(t.reliable_email_count or 0 for t in targets),
+            }
+            result[i]["progress"] = {**result[i].get("progress", {}), **batch_progress}
+
+    return page_result(total, page, page_size, result)
 
 
 def list_brands(db: Session, page: int, page_size: int) -> dict:
@@ -209,11 +234,31 @@ def list_brands(db: Session, page: int, page_size: int) -> dict:
     )
     total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     rows = db.execute(statement.offset((page - 1) * page_size).limit(page_size)).all()
+    brand_ids = [str(brand.id) for brand, _company_name, _email_count in rows]
+    evaluated_brand_ids: set[str] = set()
+    if brand_ids:
+        evidence_rows = db.execute(
+            select(SourceEvidence.entity_id, SourceEvidence.normalized_evidence).where(
+                SourceEvidence.entity_type == "brand",
+                SourceEvidence.entity_id.in_(brand_ids),
+            )
+        ).all()
+        evaluated_brand_ids = {
+            entity_id
+            for entity_id, evidence in evidence_rows
+            if isinstance(evidence, dict)
+            and bool(evidence.get("industry_source"))
+            and evidence.get("industry_confidence") is not None
+        }
     items = []
     for brand, company_name, brand_email_count in rows:
         item = to_dict(brand)
         item["company_name"] = company_name
         item["email_count"] = brand_email_count
+        item["industry_status"] = "available" if brand.category else "missing"
+        item["relevance_status"] = (
+            "evaluated" if str(brand.id) in evaluated_brand_ids else "pending"
+        )
         items.append(item)
     return page_result(total, page, page_size, items)
 
@@ -245,11 +290,13 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
         .order_by(Contact.full_name)
     ).all()
     contacts_by_brand: dict[UUID, list[dict]] = {brand_id: [] for brand_id in brand_ids}
-    contacts_by_id: dict[UUID, dict] = {}
+    # A contact may hold current positions at more than one brand. Keep every
+    # brand-specific view instead of overwriting the first one by contact ID.
+    contacts_by_id: dict[UUID, list[dict]] = {}
     for position, contact in positions:
         item = {**to_dict(contact), "title": position.title, "emails": []}
         contacts_by_brand[position.brand_id].append(item)
-        contacts_by_id[contact.id] = item
+        contacts_by_id.setdefault(contact.id, []).append(item)
 
     emails = db.scalars(
         select(EmailAddress)
@@ -266,16 +313,20 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
     for email in emails:
         email_item = to_dict(email)
         if email.contact_id in contacts_by_id:
-            contacts_by_id[email.contact_id]["emails"].append(email_item)
+            for contact_item in contacts_by_id[email.contact_id]:
+                contact_item["emails"].append(email_item)
         elif email.brand_id in direct_emails_by_brand:
             direct_emails_by_brand[email.brand_id].append(email_item)
 
-    for contact in contacts_by_id.values():
-        contact_emails = contact["emails"]
-        valid_email_count = sum(1 for email in contact_emails if _email_makes_contact_valid(email))
-        contact["email_count"] = len(contact_emails)
-        contact["valid_email_count"] = valid_email_count
-        contact["is_valid"] = valid_email_count > 0
+    for contact_items in contacts_by_id.values():
+        for contact in contact_items:
+            contact_emails = contact["emails"]
+            valid_email_count = sum(
+                1 for email in contact_emails if _email_makes_contact_valid(email)
+            )
+            contact["email_count"] = len(contact_emails)
+            contact["valid_email_count"] = valid_email_count
+            contact["is_valid"] = valid_email_count > 0
 
     items = []
     for brand in brands:
@@ -302,7 +353,13 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
     return page_result(total, page, page_size, items)
 
 
-def list_contacts(db: Session, page: int, page_size: int) -> dict:
+def list_contacts(
+    db: Session,
+    page: int,
+    page_size: int,
+    search: str | None = None,
+    organization_id: UUID | None = None,
+) -> dict:
     email_count = (
         select(func.count(EmailAddress.id))
         .where(EmailAddress.contact_id == Contact.id, EmailAddress.deleted_at.is_(None))
@@ -320,28 +377,86 @@ def list_contacts(db: Session, page: int, page_size: int) -> dict:
         .correlate(Contact)
         .scalar_subquery()
     )
+    position_title = (
+        select(ContactPosition.title)
+        .where(
+            ContactPosition.contact_id == Contact.id,
+            ContactPosition.is_current.is_(True),
+            ContactPosition.deleted_at.is_(None),
+        )
+        .order_by(ContactPosition.priority.desc(), ContactPosition.created_at.desc())
+        .limit(1)
+        .correlate(Contact)
+        .scalar_subquery()
+    )
+    position_brand_name = (
+        select(Brand.name)
+        .join(ContactPosition, ContactPosition.brand_id == Brand.id)
+        .where(
+            ContactPosition.contact_id == Contact.id,
+            ContactPosition.is_current.is_(True),
+            ContactPosition.deleted_at.is_(None),
+            Brand.deleted_at.is_(None),
+        )
+        .order_by(ContactPosition.priority.desc(), ContactPosition.created_at.desc())
+        .limit(1)
+        .correlate(Contact)
+        .scalar_subquery()
+    )
+    filters = [Contact.deleted_at.is_(None)]
+    filters.append(
+        Contact.organization_id.is_(None)
+        if organization_id is None
+        else Contact.organization_id == organization_id
+    )
+    cleaned_search = (search or "").strip()
+    if cleaned_search:
+        escaped = cleaned_search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        filters.append(
+            or_(
+                Contact.full_name.ilike(pattern, escape="\\"),
+                Contact.linkedin_url.ilike(pattern, escape="\\"),
+                select(ContactPosition.id)
+                .where(
+                    ContactPosition.contact_id == Contact.id,
+                    ContactPosition.deleted_at.is_(None),
+                    ContactPosition.title.ilike(pattern, escape="\\"),
+                )
+                .exists(),
+                select(ContactPosition.id)
+                .join(Brand, ContactPosition.brand_id == Brand.id)
+                .where(
+                    ContactPosition.contact_id == Contact.id,
+                    ContactPosition.deleted_at.is_(None),
+                    Brand.deleted_at.is_(None),
+                    Brand.name.ilike(pattern, escape="\\"),
+                )
+                .exists(),
+                select(EmailAddress.id)
+                .where(
+                    EmailAddress.contact_id == Contact.id,
+                    EmailAddress.deleted_at.is_(None),
+                    EmailAddress.normalized_address.ilike(pattern, escape="\\"),
+                )
+                .exists(),
+            )
+        )
     statement = (
         select(
             Contact,
-            ContactPosition.title,
-            Brand.name,
+            position_title.label("title"),
+            position_brand_name.label("brand_name"),
             email_count.label("email_count"),
             valid_email_count.label("valid_email_count"),
         )
-        .outerjoin(
-            ContactPosition,
-            (ContactPosition.contact_id == Contact.id)
-            & ContactPosition.is_current.is_(True)
-            & ContactPosition.deleted_at.is_(None),
-        )
-        .outerjoin(Brand, ContactPosition.brand_id == Brand.id)
-        .where(Contact.deleted_at.is_(None))
+        .where(*filters)
         .order_by(Contact.created_at.desc())
     )
     total = (
         db.scalar(
             select(func.count()).select_from(
-                select(Contact.id).where(Contact.deleted_at.is_(None)).subquery()
+                select(Contact.id).where(*filters).subquery()
             )
         )
         or 0
@@ -451,6 +566,21 @@ def create_search_task(
     organization_id: UUID | None = None,
     owner_id: UUID | None = None,
 ) -> SearchTask:
+    if payload.selected_vendors is not None:
+        unavailable: list[str] = []
+        for vendor in payload.selected_vendors:
+            credential = _vendor_credential(db, vendor)
+            if (
+                credential is None
+                or not credential.encrypted_api_key
+                or credential.last_test_ok is False
+            ):
+                unavailable.append(vendor)
+        if unavailable:
+            raise ValueError(
+                "Selected Vendors are unavailable or failed their connection test: "
+                + ", ".join(unavailable)
+            )
     configuration_version, configuration_snapshot = capture_configuration(db)
     if payload.search_intent:
         intent = SearchIntent.model_validate(payload.search_intent)
@@ -530,7 +660,11 @@ def queue_search_task(db: Session, task_id: UUID) -> SearchTask:
         return task
     if task.status == TaskStatus.cancelled:
         raise ValueError("Cancelled tasks must be copied before running again")
-    ensure_task_vendor_plan(db, task)
+    plan = ensure_task_vendor_plan(db, task)
+    if not plan.selected_vendors:
+        raise ValueError(
+            "Legacy tasks cannot be started. Copy the task and select Apollo, Hunter, or both."
+        )
     transition_task(task, TaskStatus.queued)
     task.error_message = None
     audit(db, "search_task.queue", "search_task", str(task.id))
@@ -664,15 +798,18 @@ def execute_search_task(db: Session, task_id: UUID) -> SearchTask:
                 "精准品牌任务必须填写已确认的官方官网或域名（例如 mango.com），"
                 "系统会用它排除同名公司，避免把错误域名的联系人和邮箱写入品牌。"
             )
-        approved_candidate = _candidate_for_task(db, task) if task.mode == "exact_brand" else None
-
-        # ── Vendor pipeline mode (brand_discovery + exact_brand) ──────────
         plan = ensure_task_vendor_plan(db, task)
-        if (
-            plan.execution_mode
-            not in {"legacy_waterfall", "waterfall", ""}
-            and plan.selected_vendors
-        ):
+        if not plan.selected_vendors or plan.execution_mode not in {
+            "apollo_only",
+            "hunter_only",
+            "apollo_hunter",
+        }:
+            raise ValueError(
+                "Legacy Vendor routing is no longer supported. Copy the task and select its Vendors."
+            )
+
+        # The only supported runtime path is the task-frozen full Vendor pipeline.
+        if plan.selected_vendors:
             from app.pipeline.vendor_pipeline import execute_pipeline_mode
 
             companies, company_errors, primary_name = execute_pipeline_mode(db, task, plan)
@@ -699,7 +836,14 @@ def execute_search_task(db: Session, task_id: UUID) -> SearchTask:
                 db, task.id, "candidate_filtering",
                 {"candidate_count": len(companies), "filters": task.filters},
             )
-            company_provider = None
+            complete_stage(
+                active_stage,
+                {
+                    "accepted_count": len(companies),
+                    "rejected_count": 0,
+                    "filtering_owner": "vendor_pipeline",
+                },
+            )
             active_stage = None
             # Pipeline mode handles its own brand/contact/email ingestion.
             # Skip the remaining brand_discovery/exact_brand paths below.
@@ -714,7 +858,7 @@ def execute_search_task(db: Session, task_id: UUID) -> SearchTask:
             emit(db, "task.completed", {"task_id": task.id, "progress": task.progress})
             audit(db, "search_task.complete", "search_task", str(task.id), after=task.progress)
             return task
-        elif approved_candidate is not None:
+        elif (approved_candidate := _candidate_for_task(db, task)) is not None:
             if approved_candidate.status in {"pending", "enrichment_failed", "review", "qualified"}:
                 transition_candidate(
                     db,
@@ -1091,6 +1235,7 @@ def _ingest_discovery(
                     linkedin_url=contact_payload.get("linkedin_url"),
                 ),
                 provider=contact_provider.provider,
+                organization_id=task.organization_id,
             )
             _record_task_result(
                 db,
@@ -2128,6 +2273,7 @@ def _discover_emails_by_domain(
                     title=title,
                 ),
                 provider=provider.provider,
+                organization_id=task.organization_id,
             )
             contact_id = contact.id
             _record_task_result(
@@ -2184,7 +2330,8 @@ def parse_brand_website(db: Session, brand: Brand) -> dict:
 
 
 def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> dict:
-    """Parse a brand's website and record extracted contact info as SourceEvidence."""
+    """Parse a website on explicit request and backfill missing industry evidence."""
+    from app.modules.industry_enrichment import standardize_industry
     from app.modules.website_parser import parse_website
 
     try:
@@ -2206,6 +2353,43 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
             )
         return _website_parse_payload(brand, result)
 
+    source_task = task or _latest_brand_discovery_task(db, brand.id)
+    industry_result: dict | None = None
+    industry_error: str | None = None
+    if not brand.category and len(str(result.text_snippet or "").strip()) >= 120:
+        website_evidence = {
+            "source": "official_website",
+            "company_name": brand.name,
+            "url": result.url,
+            "page_title": result.page_title,
+            "website_text": result.text_snippet[:4000],
+        }
+        ai_settings = get_ai_settings(db, source_task)
+        if not ai_settings.get("enabled") or not str(ai_settings.get("api_key") or "").strip():
+            industry_error = "系统未启用 AI 行业识别，已保存官网原始证据但未生成行业"
+        else:
+            try:
+                industry_result = standardize_industry(website_evidence, ai_settings)
+            except Exception as exc:
+                industry_error = f"官网行业识别失败：{str(exc)[:300]}"
+        if industry_result is not None:
+            brand.category = str(industry_result["standard_industry"])[:255]
+            if source_task is not None and source_task.mode == "brand_discovery":
+                brand.discovery_score, _ = score_brand_relevance(
+                    {
+                        "brand_name": brand.name,
+                        "category": brand.category,
+                        "industry": brand.category,
+                        "industry_source": "official_website_ai",
+                        "industry_confidence": int(industry_result.get("confidence") or 0),
+                    },
+                    source_task.filters or {},
+                )
+        elif industry_error is None:
+            industry_error = "官网内容不足，未识别出可靠行业"
+    elif not brand.category:
+        industry_error = "官网描述内容不足，无法生成行业证据"
+
     existing_evidence = db.scalar(
         select(SourceEvidence).where(
             SourceEvidence.entity_type == "brand",
@@ -2214,8 +2398,7 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
         )
     )
     if existing_evidence is None:
-        db.add(
-            SourceEvidence(
+        existing_evidence = SourceEvidence(
                 entity_type="brand",
                 entity_id=str(brand.id),
                 source_type=SourceType.official_website,
@@ -2223,9 +2406,33 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
                 title=result.page_title or brand.name,
                 excerpt=result.text_snippet[:500] if result.text_snippet else None,
                 content_hash=result.content_hash,
-                provider="website_parser",
+                confidence=int(industry_result.get("confidence") or 0) if industry_result else 0,
+                provider="website_parser+ai" if industry_result is not None else "website_parser",
+                task_id=source_task.id if source_task is not None else None,
+                normalized_evidence=(
+                    {
+                        "category": brand.category,
+                        "industry": brand.category,
+                        "industry_source": "official_website_ai",
+                        "industry_confidence": int(industry_result.get("confidence") or 0),
+                        "classification": industry_result,
+                    }
+                    if industry_result is not None
+                    else None
+                ) or {},
             )
-        )
+        db.add(existing_evidence)
+    elif industry_result is not None:
+        existing_evidence.confidence = int(industry_result.get("confidence") or 0)
+        existing_evidence.provider = "website_parser+ai"
+        existing_evidence.task_id = source_task.id if source_task is not None else None
+        existing_evidence.normalized_evidence = {
+            "category": brand.category,
+            "industry": brand.category,
+            "industry_source": "official_website_ai",
+            "industry_confidence": int(industry_result.get("confidence") or 0),
+            "classification": industry_result,
+        }
 
     for parsed in result.emails:
         # Create email without a contact (generic/sales emails found on homepage)
@@ -2293,10 +2500,34 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
                 provider="website_parser",
             )
         )
-    return _website_parse_payload(brand, result)
+    return _website_parse_payload(
+        brand, result, industry=industry_result, industry_error=industry_error
+    )
 
 
-def _website_parse_payload(brand: Brand, result: object | None, error: str | None = None) -> dict:
+def _latest_brand_discovery_task(db: Session, brand_id: UUID) -> SearchTask | None:
+    task_id = db.scalar(
+        select(SourceEvidence.task_id)
+        .join(SearchTask, SearchTask.id == SourceEvidence.task_id)
+        .where(
+            SourceEvidence.entity_type == "brand",
+            SourceEvidence.entity_id == str(brand_id),
+            SourceEvidence.task_id.is_not(None),
+            SearchTask.mode == "brand_discovery",
+        )
+        .order_by(SourceEvidence.created_at.desc())
+        .limit(1)
+    )
+    return db.get(SearchTask, task_id) if task_id is not None else None
+
+
+def _website_parse_payload(
+    brand: Brand,
+    result: object | None,
+    error: str | None = None,
+    industry: dict | None = None,
+    industry_error: str | None = None,
+) -> dict:
     return {
         "brand_id": str(brand.id),
         "url": getattr(result, "url", brand.primary_website),
@@ -2312,6 +2543,13 @@ def _website_parse_payload(brand: Brand, result: object | None, error: str | Non
         "elapsed_ms": getattr(result, "elapsed_ms", 0),
         "pages_scanned": getattr(result, "pages_scanned", 0),
         "attempted_urls": getattr(result, "attempted_urls", []),
+        "industry": brand.category,
+        "industry_confidence": (
+            int(industry.get("confidence") or 0) if industry is not None else None
+        ),
+        "industry_source": "official_website_ai" if industry is not None else None,
+        "industry_error": industry_error,
+        "discovery_score": brand.discovery_score,
     }
 
 
@@ -2344,28 +2582,41 @@ def _ensure_email_verified(
 def _apply_provider_verification(
     db: Session, email: EmailAddress, email_payload: dict, provider_name: str
 ) -> None:
-    """Skip the separate verification waterfall when the provider already verified the email.
+    """Persist a Vendor's conclusive email status as verification evidence.
 
-    Hunter Domain Search returns ``verification.status`` in each email payload.
-    Apollo enrichment and Hunter Email Finder do NOT return verification results,
-    so those emails still flow through the standard verification waterfall.
+    Hunter Domain Search and Apollo enrichment can return an email status with
+    the discovered address. Only a status that the Vendor defines as verified
+    is promoted to the valid pool; inconclusive statuses remain reviewable.
     """
     verification_status = str(email_payload.get("verification_status") or "").strip().lower()
     if not verification_status:
         return
-    valid_statuses = {"valid", "invalid", "accept_all", "webmail", "risky", "unknown"}
+    verification_status = verification_status.replace("_", " ")
+    vendor = str(email_payload.get("verification_provider") or provider_name).casefold()
+    is_apollo = "apollo" in vendor
+    valid_statuses = (
+        {"verified", "unverified", "likely to engage", "unavailable", "invalid"}
+        if is_apollo
+        else {"valid", "invalid", "accept all", "webmail", "risky", "unknown"}
+    )
     if verification_status not in valid_statuses:
         return
-    mapped = _hunter_verification_status(verification_status)
-    score = _hunter_verification_score(verification_status)
+    if is_apollo:
+        mapped, score = _apollo_verification_result(verification_status)
+    else:
+        hunter_status = verification_status.replace(" ", "_")
+        mapped = _hunter_verification_status(hunter_status)
+        score = _hunter_verification_score(hunter_status)
     result_data = {
         "result": mapped,
         "score": score,
-        "is_catch_all": verification_status in {"accept_all", "webmail"},
+        "is_catch_all": verification_status in {"accept all", "webmail"},
         "is_disposable": False,
         "domain_deliverable": True,
         "provider": provider_name,
         "pre_verified": True,
+        "vendor_status": verification_status,
+        "verification_source": email_payload.get("verification_source"),
     }
     email.status = mapped
     email.deliverability_score = score
@@ -2388,6 +2639,18 @@ def _apply_provider_verification(
             checked_at=utc_now(),
         )
     )
+
+
+def _apollo_verification_result(status: str) -> tuple[str, int]:
+    if status == "verified":
+        return "valid", 100
+    if status == "invalid":
+        return "invalid", 0
+    if status == "likely to engage":
+        return "risky", 60
+    if status == "unverified":
+        return "risky", 40
+    return "unknown", 0
 
 
 def _hunter_verification_status(status: str) -> str:
@@ -2484,6 +2747,8 @@ def create_brand(
         select(Brand).where(Brand.normalized_name == normalized_name, Brand.deleted_at.is_(None))
     )
     if existing:
+        if payload.category and not existing.category:
+            existing.category = payload.category
         existing.discovery_score = max(existing.discovery_score, discovery_score)
         return existing
     if company is None and payload.company_name:
@@ -2639,15 +2904,125 @@ def approve_discovery_brand(db: Session, brand: Brand) -> SearchTask:
     return task
 
 
-def create_contact(db: Session, payload: ContactCreate, provider: str = "manual") -> Contact:
+def _normalized_contact_text(value: str | None) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _normalized_linkedin_url(value: str | None) -> str:
+    return str(value or "").strip().rstrip("/").casefold()
+
+
+def _lock_contact_identity(db: Session, identity_key: str) -> None:
+    """Serialize matching contact writes on PostgreSQL without affecting SQLite tests."""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(identity_key, 0))))
+
+
+def ensure_contact_position(
+    db: Session,
+    contact_id: UUID,
+    company_id: UUID | None,
+    brand_id: UUID | None,
+    title: str,
+    provider: str,
+) -> ContactPosition:
+    normalized_title = _normalized_contact_text(title)
+    filters = [
+        ContactPosition.contact_id == contact_id,
+        ContactPosition.deleted_at.is_(None),
+        func.lower(func.trim(ContactPosition.title)) == normalized_title,
+    ]
+    filters.append(
+        ContactPosition.company_id.is_(None)
+        if company_id is None
+        else ContactPosition.company_id == company_id
+    )
+    filters.append(
+        ContactPosition.brand_id.is_(None)
+        if brand_id is None
+        else ContactPosition.brand_id == brand_id
+    )
+    existing = db.scalar(select(ContactPosition).where(*filters).limit(1))
+    if existing is not None:
+        return existing
+    position = ContactPosition(
+        contact_id=contact_id,
+        company_id=company_id,
+        brand_id=brand_id,
+        title=title.strip(),
+        priority=title_priority(title),
+        is_current=True,
+        provider=provider,
+    )
+    db.add(position)
+    # SessionLocal disables autoflush. Persist now so a second Vendor/task sees it.
+    db.flush()
+    return position
+
+
+def create_contact(
+    db: Session,
+    payload: ContactCreate,
+    provider: str = "manual",
+    organization_id: UUID | None = None,
+) -> Contact:
     full_name = f"{payload.first_name} {payload.last_name}".strip()
-    query = select(Contact).where(Contact.full_name == full_name, Contact.deleted_at.is_(None))
-    if payload.linkedin_url:
-        query = select(Contact).where(
-            Contact.linkedin_url == payload.linkedin_url, Contact.deleted_at.is_(None)
+    normalized_name = _normalized_contact_text(full_name)
+    normalized_title = _normalized_contact_text(payload.title)
+    normalized_linkedin = _normalized_linkedin_url(payload.linkedin_url)
+    organization_key = str(organization_id or "unscoped")
+    scope_key = str(payload.brand_id or payload.company_id or "unscoped")
+    identity_key = (
+        f"org:{organization_key}|linkedin:{normalized_linkedin}"
+        if normalized_linkedin
+        else f"org:{organization_key}|scope:{scope_key}|name:{normalized_name}|title:{normalized_title}"
+    )
+    _lock_contact_identity(db, identity_key)
+
+    existing = None
+    if normalized_linkedin:
+        linkedin_query = select(Contact).where(
+            func.lower(func.rtrim(Contact.linkedin_url, "/")) == normalized_linkedin,
+            Contact.deleted_at.is_(None),
         )
-    existing = db.scalar(query)
-    if existing:
+        linkedin_query = linkedin_query.where(
+            Contact.organization_id.is_(None)
+            if organization_id is None
+            else Contact.organization_id == organization_id
+        )
+        existing = db.scalar(linkedin_query.limit(1))
+    if existing is None:
+        position_filters = [
+            ContactPosition.deleted_at.is_(None),
+            func.lower(func.trim(ContactPosition.title)) == normalized_title,
+        ]
+        if payload.brand_id is not None:
+            position_filters.append(ContactPosition.brand_id == payload.brand_id)
+        elif payload.company_id is not None:
+            position_filters.append(ContactPosition.company_id == payload.company_id)
+        else:
+            position_filters.extend(
+                [ContactPosition.brand_id.is_(None), ContactPosition.company_id.is_(None)]
+            )
+        query = (
+            select(Contact)
+            .join(ContactPosition, ContactPosition.contact_id == Contact.id)
+            .where(
+                func.lower(func.trim(Contact.full_name)) == normalized_name,
+                Contact.deleted_at.is_(None),
+                *position_filters,
+            )
+        )
+        query = query.where(
+            Contact.organization_id.is_(None)
+            if organization_id is None
+            else Contact.organization_id == organization_id
+        )
+        existing = db.scalar(query.limit(1))
+    if existing is not None:
+        ensure_contact_position(
+            db, existing.id, payload.company_id, payload.brand_id, payload.title, provider
+        )
         return existing
     contact = Contact(
         first_name=payload.first_name,
@@ -2655,19 +3030,12 @@ def create_contact(db: Session, payload: ContactCreate, provider: str = "manual"
         full_name=full_name,
         linkedin_url=payload.linkedin_url,
         status="invalid",
+        organization_id=organization_id,
     )
     db.add(contact)
     db.flush()
-    db.add(
-        ContactPosition(
-            contact_id=contact.id,
-            company_id=payload.company_id,
-            brand_id=payload.brand_id,
-            title=payload.title,
-            priority=title_priority(payload.title),
-            is_current=True,
-            provider=provider,
-        )
+    ensure_contact_position(
+        db, contact.id, payload.company_id, payload.brand_id, payload.title, provider
     )
     audit(db, "contact.create", "contact", str(contact.id), after=payload.model_dump(mode="json"))
     emit(db, "contact.discovered", {"contact_id": contact.id, "provider": provider})
@@ -3901,7 +4269,11 @@ def vendor_credential_public(credential: VendorCredential) -> dict:
 
 
 def list_vendor_credentials(db: Session) -> list[dict]:
-    credentials = db.scalars(select(VendorCredential).order_by(VendorCredential.vendor.asc())).all()
+    credentials = db.scalars(
+        select(VendorCredential)
+        .where(VendorCredential.vendor.in_(["apollo", "hunter"]))
+        .order_by(VendorCredential.vendor.asc())
+    ).all()
     return [vendor_credential_public(item) for item in credentials]
 
 
@@ -4016,45 +4388,53 @@ def ensure_task_vendor_plan(db: Session, task: SearchTask) -> TaskVendorPlan:
     if plan is not None:
         return plan
 
-    # ── Determine execution mode from task's selected_vendors ────────────
+    # New search tasks always use an explicit, task-frozen Vendor selection.
     filters = task.filters if isinstance(task.filters, dict) else {}
     selected = filters.get("selected_vendors")
-    execution_mode = "legacy_waterfall"
-    pipeline_source = "legacy_global_strategy"
-    selected_vendors_list: list[str] = []
+    selected_vendors_list = (
+        list(dict.fromkeys(str(v).strip().lower() for v in selected))
+        if isinstance(selected, list)
+        else []
+    )
+    if selected_vendors_list and not set(selected_vendors_list) <= {"apollo", "hunter"}:
+        raise ValueError(
+            "This task has an invalid Vendor selection. Select Apollo, Hunter, or both."
+        )
+    if not selected_vendors_list:
+        # Read-only compatibility plan for historical tasks. The task executor
+        # rejects this mode; it remains only so old records and audit screens load.
+        strategy = get_vendor_strategy(db)
+        plan = TaskVendorPlan(
+            task_id=task.id,
+            primary_vendor=str(strategy["primary_vendor"]),
+            fallback_vendors=list(strategy.get("fallback_vendors") or []),
+            verification_vendor=strategy.get("verification_vendor"),
+            adapter_version=str(strategy.get("adapter_version") or ADAPTER_VERSION),
+            local_verification_mode=str(strategy.get("local_verification_mode") or "disabled"),
+            local_verification_rollout=int(strategy.get("local_verification_rollout") or 0),
+            local_verification_sample=int(strategy.get("local_verification_sample") or 10),
+            execution_mode="legacy_waterfall",
+            selected_vendors=[],
+            pipeline_source="legacy_read_only",
+            vendor_routes={},
+        )
+        db.add(plan)
+        db.flush()
+        return plan
+    execution_mode = "apollo_hunter"
+    if selected_vendors_list == ["apollo"]:
+        execution_mode = "apollo_only"
+    elif selected_vendors_list == ["hunter"]:
+        execution_mode = "hunter_only"
+    pipeline_source = "user_selection"
     vendor_routes: dict = {}
 
-    if isinstance(selected, list) and selected:
-        selected_vendors_list = [str(v).strip().lower() for v in selected]
-        pipeline_source = "user_selection"
-        if selected_vendors_list == ["apollo"]:
-            execution_mode = "apollo_only"
-        elif selected_vendors_list == ["hunter"]:
-            execution_mode = "hunter_only"
-        elif set(selected_vendors_list) == {"apollo", "hunter"}:
-            execution_mode = "apollo_hunter"
-
-    snapshot = task.configuration_snapshot if isinstance(task.configuration_snapshot, dict) else {}
-    strategy_data = (
-        snapshot.get("vendor_strategy")
-        if isinstance(snapshot.get("vendor_strategy"), dict)
-        else None
-    )
-    if not strategy_data:
-        strategy_data = get_vendor_strategy(db)
-
-    # ── Build vendor_routes freeze for pipeline mode ─────────────────────
-    if execution_mode != "legacy_waterfall":
-        for vendor in selected_vendors_list:
-            adapter = adapter_for(vendor)
-            vc = _vendor_credential(db, vendor)
-            vendor_routes[vendor] = {
+    for vendor in selected_vendors_list:
+        adapter = adapter_for(vendor)
+        vc = _vendor_credential(db, vendor)
+        vendor_routes[vendor] = {
                 "vendor": vendor,
-                "adapter_version": (
-                    str(adapter.capabilities.get("adapter_version", ADAPTER_VERSION))
-                    if adapter and adapter.capabilities
-                    else ADAPTER_VERSION
-                ),
+                "adapter_version": adapter.adapter_version if adapter else ADAPTER_VERSION,
                 "credential_id": str(vc.id) if vc else None,
                 "stages": {
                     "company_search": {
@@ -4070,31 +4450,32 @@ def ensure_task_vendor_plan(db: Session, task: SearchTask) -> TaskVendorPlan:
                     "from_contact_search" if vendor == "apollo"
                     else "email_finder_domain_search"
                 ),
-            }
-            if vendor == "apollo":
-                vendor_routes[vendor]["stages"]["contact_enrichment"] = {
+        }
+        if vendor == "apollo":
+            vendor_routes[vendor]["stages"]["contact_enrichment"] = {
                     "provider": f"{vendor}-contact-search",
                     "enabled": True,
-                }
-            elif vendor == "hunter":
-                vendor_routes[vendor]["stages"]["email_finder"] = {
+            }
+        elif vendor == "hunter":
+            vendor_routes[vendor]["stages"]["email_finder"] = {
                     "provider": f"{vendor}-email-finder",
                     "enabled": True,
-                }
-                vendor_routes[vendor]["stages"]["email_verifier"] = {
+            }
+            vendor_routes[vendor]["stages"]["email_verifier"] = {
                     "provider": f"{vendor}-email-verifier",
                     "enabled": True,
-                }
+            }
 
     plan = TaskVendorPlan(
         task_id=task.id,
-        primary_vendor=str(strategy_data["primary_vendor"]),
-        fallback_vendors=list(strategy_data.get("fallback_vendors") or []),
-        verification_vendor=strategy_data.get("verification_vendor"),
-        adapter_version=str(strategy_data.get("adapter_version") or ADAPTER_VERSION),
-        local_verification_mode=str(strategy_data.get("local_verification_mode") or "disabled"),
-        local_verification_rollout=int(strategy_data.get("local_verification_rollout") or 0),
-        local_verification_sample=int(strategy_data.get("local_verification_sample") or 10),
+        # Retained columns are populated for additive-schema compatibility only.
+        primary_vendor=selected_vendors_list[0],
+        fallback_vendors=[],
+        verification_vendor="hunter" if "hunter" in selected_vendors_list else None,
+        adapter_version=ADAPTER_VERSION,
+        local_verification_mode="disabled",
+        local_verification_rollout=0,
+        local_verification_sample=10,
         execution_mode=execution_mode,
         selected_vendors=selected_vendors_list,
         pipeline_source=pipeline_source,
@@ -4439,14 +4820,16 @@ def enabled_providers(
     ):
         selected = list(plan.selected_vendors or [])
         if selected:
-            order = [v for v in order if v in selected]
-            if provider_type == "email_verifier":
-                order = [v for v in order if v in selected]
-        # Prevent auto-fallback to unselected vendors
-        SEARCH_VENDORS_FILTERED = tuple(v for v in SEARCH_VENDORS if v in selected)
-
+            # The frozen user selection is the complete routing source for new
+            # tasks; legacy primary/fallback/verification fields must not hide
+            # a selected Vendor or reintroduce an unselected one.
+            order = selected
     if provider_type == "email_verifier":
-        order.extend(vendor for vendor in VERIFICATION_VENDORS if vendor not in order)
+        if not (
+            task is not None
+            and plan.execution_mode not in {"legacy_waterfall", "waterfall", ""}
+        ):
+            order.extend(vendor for vendor in VERIFICATION_VENDORS if vendor not in order)
         if local_mode != "disabled":
             order = [
                 "aftership_local",
@@ -4678,9 +5061,17 @@ def execute_provider_waterfall(
     task: SearchTask | None = None,
     entity_type: str | None = None,
     item_filter: Callable[[list[dict]], list[dict]] | None = None,
+    allowed_vendors: set[str] | None = None,
 ) -> tuple[ProviderConfig | None, list[dict], list[str]]:
     """Run providers until one returns mapped items that pass business validation."""
     providers = enabled_providers(db, provider_type, task)
+    if allowed_vendors is not None:
+        providers = [
+            provider
+            for provider in providers
+            if str(decrypt_provider_config(provider.config or {}).get("adapter") or "").casefold()
+            in allowed_vendors
+        ]
     if not providers:
         return None, [], [f"No enabled {provider_type} Provider is configured"]
 
@@ -5211,8 +5602,14 @@ def plan_ai_task(db: Session, payload: AITaskPlanRequest) -> dict:
     return result
 
 
-def list_roles(db: Session, page: int, page_size: int) -> dict:
-    return list_page(db, Role, page, page_size)
+def list_roles(db: Session, page: int, page_size: int, *, actor: User) -> dict:
+    from app.core.security import can_assign_role
+
+    roles = list(db.scalars(select(Role).order_by(Role.created_at.desc())).all())
+    roles = [role for role in roles if can_assign_role(db, actor, role.id)]
+    total = len(roles)
+    items = [to_dict(role) for role in roles[(page - 1) * page_size:page * page_size]]
+    return page_result(total, page, page_size, items)
 
 
 def create_role(db: Session, payload: RoleCreate) -> Role:
@@ -5246,16 +5643,18 @@ def update_role(db: Session, role: Role, payload: RoleUpdate) -> Role:
     return role
 
 
-def list_users(db: Session, page: int, page_size: int) -> dict:
+def list_users(db: Session, page: int, page_size: int, *, actor: User) -> dict:
+    from app.core.security import can_manage_user
+
     statement = (
         select(User, Role.name)
         .outerjoin(Role, User.role_id == Role.id)
         .where(User.deleted_at.is_(None))
     )
-    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
-    rows = db.execute(
-        statement.order_by(User.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
-    ).all()
+    rows = db.execute(statement.order_by(User.created_at.desc())).all()
+    rows = [(item, role_name) for item, role_name in rows if can_manage_user(db, actor, item)]
+    total = len(rows)
+    rows = rows[(page - 1) * page_size:page * page_size]
     items = []
     for user, role_name in rows:
         item = to_dict(user)
@@ -5265,7 +5664,12 @@ def list_users(db: Session, page: int, page_size: int) -> dict:
     return page_result(total, page, page_size, items)
 
 
-def create_user(db: Session, payload: UserCreate) -> User:
+def create_user(
+    db: Session,
+    payload: UserCreate,
+    *,
+    organization_id: UUID | None = None,
+) -> User:
     from app.core.security import hash_password
 
     email = str(payload.email).lower()
@@ -5277,6 +5681,7 @@ def create_user(db: Session, payload: UserCreate) -> User:
         password_hash=hash_password(payload.password),
         role_id=payload.role_id,
         department_id=payload.department_id,
+        organization_id=organization_id,
         status=payload.status,
     )
     db.add(user)

@@ -2,52 +2,53 @@
   <div class="page-heading">
     <div>
       <h1 class="page-title">系统配置</h1>
-      <span class="muted">所有可变规则、权限和数据源均在此维护</span>
+      <span class="muted">按业务规则、数据服务和访问权限分区管理，修改后立即生效</span>
     </div>
+    <el-button :loading="pageLoading" @click="reloadCurrentTab">刷新当前设置</el-button>
   </div>
 
-  <el-tabs v-model="activeTab">
-    <el-tab-pane label="业务规则" name="rules">
+  <el-tabs v-model="activeTab" class="settings-tabs">
+    <el-tab-pane v-if="canReadSettings" label="业务规则" name="rules">
       <div class="panel">
-        <div class="panel-heading"><h3>职位词库与排除词</h3></div>
-        <el-form label-width="150px" :model="systemRules">
-          <el-form-item label="P1 高优先级职位"><el-input v-model="systemRules.p1" type="textarea" :rows="2" placeholder="每行一个职位" /></el-form-item>
-          <el-form-item label="P2 普通职位"><el-input v-model="systemRules.p2" type="textarea" :rows="2" placeholder="每行一个职位" /></el-form-item>
-          <el-form-item label="P3 补充职位"><el-input v-model="systemRules.p3" type="textarea" :rows="2" placeholder="每行一个职位" /></el-form-item>
-          <el-form-item label="排除职位"><el-input v-model="systemRules.excluded" type="textarea" :rows="2" placeholder="每行一个职位" /></el-form-item>
+        <div class="panel-heading"><div><h3>职位匹配规则</h3><p class="section-help">每行填写一个职位。系统会优先寻找 P1，随后依次使用 P2、P3；排除词始终优先。</p></div></div>
+        <el-form label-position="top" :model="systemRules" class="settings-grid settings-grid--two">
+          <el-form-item label="P1 · 首选决策人"><el-input v-model="systemRules.p1" type="textarea" :rows="3" placeholder="例如：Head of Buying&#10;Purchasing Director" /></el-form-item>
+          <el-form-item label="P2 · 次选联系人"><el-input v-model="systemRules.p2" type="textarea" :rows="3" placeholder="例如：Senior Buyer&#10;Category Manager" /></el-form-item>
+          <el-form-item label="P3 · 补充联系人"><el-input v-model="systemRules.p3" type="textarea" :rows="3" placeholder="例如：Buyer&#10;Merchandiser" /></el-form-item>
+          <el-form-item label="不联系的职位"><el-input v-model="systemRules.excluded" type="textarea" :rows="3" placeholder="例如：Intern&#10;Assistant" /></el-form-item>
         </el-form>
       </div>
       <div class="panel">
-        <h3>邮箱评分与任务执行规则</h3>
-        <el-form label-width="170px" :model="systemRules" inline>
-          <el-form-item label="有效邮箱评分阈值"><el-input-number v-model="systemRules.validScore" :min="0" :max="100" /></el-form-item>
-          <el-form-item label="风险邮箱评分阈值"><el-input-number v-model="systemRules.riskyScore" :min="0" :max="100" /></el-form-item>
-          <el-form-item label="最大重试次数"><el-input-number v-model="systemRules.maxAttempts" :min="0" :max="10" /></el-form-item>
-          <el-form-item label="重试等待秒数"><el-input-number v-model="systemRules.retryDelay" :min="0" :max="3600" /></el-form-item>
-          <el-form-item label="任务最大并发"><el-input-number v-model="systemRules.maxConcurrency" :min="1" :max="50" /></el-form-item>
-          <el-form-item label="每品牌默认联系人"><el-input-number v-model="systemRules.defaultContactLimit" :min="1" :max="50" /></el-form-item>
-          <el-form-item><el-button type="primary" :loading="rulesSaving" @click="saveRules">保存业务规则</el-button></el-form-item>
+        <div class="panel-heading"><div><h3>邮箱与任务执行</h3><p class="section-help">使用安全默认值控制邮箱判定、失败重试和任务处理规模。</p></div></div>
+        <el-form label-position="top" :model="systemRules" class="settings-grid settings-grid--three">
+          <el-form-item label="判定为有效（分）"><el-input-number v-model="systemRules.validScore" :min="0" :max="100" controls-position="right" /></el-form-item>
+          <el-form-item label="判定为风险（分）"><el-input-number v-model="systemRules.riskyScore" :min="0" :max="100" controls-position="right" /></el-form-item>
+          <el-form-item label="每个品牌联系人上限"><el-input-number v-model="systemRules.defaultContactLimit" :min="1" :max="50" controls-position="right" /></el-form-item>
+          <el-form-item label="失败重试次数"><el-input-number v-model="systemRules.maxAttempts" :min="0" :max="10" controls-position="right" /></el-form-item>
+          <el-form-item label="重试间隔（秒）"><el-input-number v-model="systemRules.retryDelay" :min="0" :max="3600" controls-position="right" /></el-form-item>
+          <el-form-item label="同时处理的任务数"><el-input-number v-model="systemRules.maxConcurrency" :min="1" :max="50" controls-position="right" /></el-form-item>
         </el-form>
       </div>
       <div class="panel">
         <div class="panel-heading"><h3>AI 协调器</h3></div>
         <el-alert title="AI 只生成可审阅的搜索方案，不会自动执行任务或发送邮件。" type="info" :closable="false" show-icon style="margin-bottom: 16px" />
-        <el-form label-width="150px" :model="aiSettings">
-          <el-form-item label="启用 AI"><el-switch v-model="aiSettings.enabled" /></el-form-item>
-          <el-form-item label="兼容 API 地址"><el-input v-model="aiSettings.baseUrl" placeholder="https://api.openai.com/v1" /></el-form-item>
-          <el-form-item label="模型名称"><el-input v-model="aiSettings.modelName" placeholder="gpt-4o-mini" /></el-form-item>
-          <el-form-item label="请求超时（秒）"><el-input-number v-model="aiSettings.requestTimeoutSeconds" :min="10" :max="180" /></el-form-item>
-          <el-form-item label="API Key"><el-input v-model="aiSettings.apiKey" type="password" show-password placeholder="留空则保留已保存的密钥" /></el-form-item>
+        <el-form label-position="top" :model="aiSettings" class="settings-grid settings-grid--two">
+          <el-form-item label="AI 搜索方案"><el-switch v-model="aiSettings.enabled" inline-prompt active-text="启用" inactive-text="停用" /></el-form-item>
+          <el-form-item label="请求超时（秒）"><el-input-number v-model="aiSettings.requestTimeoutSeconds" :min="10" :max="180" controls-position="right" /></el-form-item>
+          <el-form-item label="API 地址"><el-input v-model="aiSettings.baseUrl" placeholder="https://api.openai.com/v1" /></el-form-item>
+          <el-form-item label="模型"><el-input v-model="aiSettings.modelName" placeholder="例如 gpt-4o-mini" /></el-form-item>
+          <el-form-item label="API Key" class="grid-span-full"><el-input v-model="aiSettings.apiKey" type="password" show-password autocomplete="new-password" placeholder="留空会继续使用已保存的密钥" /></el-form-item>
         </el-form>
       </div>
+      <div v-if="canWriteSettings" class="sticky-actions"><span class="muted">保存后，新创建的任务将使用这些设置。</span><el-button type="primary" :loading="rulesSaving" @click="saveRules">保存业务规则与 AI 设置</el-button></div>
     </el-tab-pane>
 
-    <el-tab-pane label="Provider" name="providers">
+    <el-tab-pane v-if="canReadProviders" label="Provider" name="providers">
       <div class="panel">
         <div class="panel-heading"><h3>第三方平台密钥</h3><span class="muted">接口协议和字段映射由系统代码维护</span></div>
         <el-alert
-          title="只需配置每个平台的 API Key"
-          description="连接测试使用第三方账户或额度接口，不执行付费搜索。任务会固化主备平台顺序，并在失败阶段自动切换后继续。"
+          title="配置任务可选择的 Apollo/Hunter API Key"
+          description="每个任务在创建时选择 Apollo、Hunter 或同时选择两个；选中的平台分别独立执行公司、联系人和邮箱全流程，不再跨平台自动切换。"
           type="info"
           :closable="false"
           show-icon
@@ -58,7 +59,7 @@
           <el-table-column label="API Key / 内部 Token" min-width="300">
             <template #default="{ row }"><el-input v-model="vendorKeys[row.vendor]" type="password" show-password :placeholder="row.api_key_configured ? '已配置，留空保存将保留原密钥' : (row.vendor === 'aftership_local' ? '请输入 VERIFIER_TOKEN' : '请输入 API Key')" /></template>
           </el-table-column>
-          <el-table-column label="启用" width="90"><template #default="{ row }"><el-switch v-model="row.enabled" /></template></el-table-column>
+          <el-table-column label="状态" width="110"><template #default="{ row }"><el-switch v-model="row.enabled" inline-prompt active-text="启用" inactive-text="停用" aria-label="启用或停用供应商" /></template></el-table-column>
           <el-table-column label="测试结果" min-width="190">
             <template #default="{ row }"><el-tag v-if="row.last_test_ok === true" type="success">连接成功</el-tag><el-tag v-else-if="row.last_test_ok === false" type="danger">连接失败</el-tag><span v-else class="muted">未测试</span><div v-if="row.last_test_error" class="vendor-error">{{ row.last_test_error }}</div></template>
           </el-table-column>
@@ -68,65 +69,62 @@
         </el-table>
       </div>
       <div class="panel">
-        <div class="panel-heading"><h3>任务平台策略</h3><span class="muted">任务启动后使用不可变快照</span></div>
-        <el-form label-width="140px" :model="vendorStrategy">
-          <el-form-item label="主平台"><el-select v-model="vendorStrategy.primary_vendor" style="width: 320px"><el-option v-for="item in searchVendorOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
-          <el-form-item label="备用平台顺序"><el-select v-model="vendorStrategy.fallback_vendors" multiple style="width: 520px"><el-option v-for="item in fallbackVendorOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
-          <el-form-item label="付费邮箱验证平台"><el-select v-model="vendorStrategy.verification_vendor" clearable style="width: 320px"><el-option label="ZeroBounce" value="zerobounce" /><el-option label="Hunter" value="hunter" /></el-select></el-form-item>
-          <el-form-item label="本地验证模式"><el-select v-model="vendorStrategy.local_verification_mode" style="width: 320px"><el-option label="禁用" value="disabled" /><el-option label="影子对比" value="shadow" /><el-option label="正式启用" value="active" /></el-select></el-form-item>
-          <el-form-item label="本地验证流量"><el-slider v-model="vendorStrategy.local_verification_rollout" :min="0" :max="100" show-input style="width: 520px" /></el-form-item>
-          <el-form-item label="有效结果抽检"><el-slider v-model="vendorStrategy.local_verification_sample" :min="1" :max="100" show-input style="width: 520px" /></el-form-item>
-          <el-alert title="本地验证依赖出站 TCP 25 或 SMTP SOCKS 代理；Unknown 和 Catch-all 会自动交给付费平台。" type="info" :closable="false" show-icon style="margin-bottom: 16px" />
-          <el-form-item><el-button type="primary" @click="saveVendorStrategy">保存策略</el-button></el-form-item>
-        </el-form>
+        <div class="panel-heading"><div><h3>高级数据源</h3><p class="section-help">添加自建 HTTP 接口或调整数据源优先级。普通使用只需配置上方平台密钥。</p></div><el-button type="primary" plain @click="openProvider()">新增数据源</el-button></div>
+        <EntityTable ref="providerTable" endpoint="/provider-configs" :columns="providerColumns">
+          <template #cell-type="{ value }"><el-tag type="info">{{ providerTypeLabel(value) }}</el-tag></template>
+          <template #cell-enabled="{ row }"><el-switch :model-value="row.enabled" inline-prompt active-text="启用" inactive-text="停用" @change="toggleProvider(row, Boolean($event))" /></template>
+          <template #cell-config="{ row }"><span>{{ providerSummary(row) }}</span></template>
+          <template #actions="{ row }"><el-button size="small" @click="openProvider(row)">编辑</el-button><el-button size="small" @click="testProvider(row.id)">测试连接</el-button><el-button size="small" type="danger" plain @click="removeProvider(row.id)">删除</el-button></template>
+        </EntityTable>
       </div>
     </el-tab-pane>
 
-    <el-tab-pane label="用户与角色" name="access">
+    <el-tab-pane v-if="canReadUsers || canReadRoles" label="用户与角色" name="access">
       <el-row :gutter="16">
-        <el-col :xs="24" :lg="12">
+        <el-col v-if="canReadRoles" :xs="24" :lg="canReadUsers ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>角色与权限</h3><el-button @click="openRole()">新增角色</el-button></div>
+            <div class="panel-heading"><h3>角色与权限</h3><el-button v-if="canWriteRoles" @click="openRole()">新增角色</el-button></div>
             <EntityTable ref="roleTable" endpoint="/roles" :columns="roleColumns">
-              <template #cell-permissions="{ value }"><code>{{ compact(value) }}</code></template>
-              <template #actions="{ row }"><el-button size="small" @click="openRole(row)">编辑</el-button></template>
+              <template #cell-permissions="{ value }"><span>{{ permissionSummary(value) }}</span></template>
+              <template #actions="{ row }"><el-button v-if="canWriteRoles" size="small" @click="openRole(row)">编辑</el-button></template>
             </EntityTable>
           </div>
         </el-col>
-        <el-col :xs="24" :lg="12">
+        <el-col v-if="canReadUsers" :xs="24" :lg="canReadRoles ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>用户</h3><el-button @click="openUser()">新增用户</el-button></div>
+            <div class="panel-heading"><h3>用户</h3><el-button v-if="canWriteUsers" @click="openUser()">新增用户</el-button></div>
             <EntityTable ref="userTable" endpoint="/users" :columns="userColumns">
-              <template #actions="{ row }"><el-button size="small" @click="openUser(row)">编辑</el-button></template>
+              <template #cell-status="{ value }"><el-tag :type="value === 'active' ? 'success' : 'info'">{{ value === 'active' ? '启用' : '停用' }}</el-tag></template>
+              <template #actions="{ row }"><el-button v-if="canWriteUsers" size="small" @click="openUser(row)">编辑</el-button></template>
             </EntityTable>
           </div>
         </el-col>
       </el-row>
     </el-tab-pane>
 
-    <el-tab-pane label="字段与标签" name="metadata">
+    <el-tab-pane v-if="canReadTags || canReadCustomFields" label="字段与标签" name="metadata">
       <el-row :gutter="16">
-        <el-col :xs="24" :lg="12">
+        <el-col v-if="canReadTags" :xs="24" :lg="canReadCustomFields ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>标签</h3><el-button @click="tagVisible = true">新增标签</el-button></div>
-            <EntityTable ref="tagTable" endpoint="/tags" :columns="tagColumns" />
+            <div class="panel-heading"><h3>标签</h3><el-button v-if="canWriteTags" @click="tagVisible = true">新增标签</el-button></div>
+            <EntityTable ref="tagTable" endpoint="/tags" :columns="tagColumns"><template #cell-module="{ value }">{{ moduleLabel(value) }}</template></EntityTable>
           </div>
         </el-col>
-        <el-col :xs="24" :lg="12">
+        <el-col v-if="canReadCustomFields" :xs="24" :lg="canReadTags ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>自定义字段</h3><el-button @click="customFieldVisible = true">新增字段</el-button></div>
-            <EntityTable ref="customFieldTable" endpoint="/custom-fields" :columns="customFieldColumns" />
+            <div class="panel-heading"><h3>自定义字段</h3><el-button v-if="canWriteCustomFields" @click="customFieldVisible = true">新增字段</el-button></div>
+            <EntityTable ref="customFieldTable" endpoint="/custom-fields" :columns="customFieldColumns"><template #cell-module="{ value }">{{ moduleLabel(value) }}</template><template #cell-type="{ value }">{{ fieldTypeLabel(value) }}</template><template #cell-is_required="{ value }"><el-tag :type="value ? 'warning' : 'info'">{{ value ? '必填' : '选填' }}</el-tag></template></EntityTable>
           </div>
         </el-col>
       </el-row>
     </el-tab-pane>
 
-    <el-tab-pane label="审计日志" name="audit">
-      <div class="panel"><EntityTable endpoint="/audit-logs" :columns="auditColumns" :page-size="20" /></div>
+    <el-tab-pane v-if="canReadAudit" label="审计日志" name="audit">
+      <div class="panel"><div class="panel-heading"><div><h3>配置变更记录</h3><p class="section-help">用于追溯谁在何时修改了哪些设置，不包含密码和密钥明文。</p></div></div><EntityTable endpoint="/audit-logs" :columns="auditColumns" :page-size="20"><template #cell-action="{ value }">{{ auditActionLabel(value) }}</template><template #cell-entity_type="{ value }">{{ auditEntityLabel(value) }}</template><template #cell-after="{ value }"><span>{{ auditChangeSummary(value) }}</span></template></EntityTable></div>
     </el-tab-pane>
   </el-tabs>
 
-  <el-dialog v-if="false" v-model="providerVisible" :title="provider.id ? '编辑 Provider' : '新增 Provider'" width="720px">
+  <el-dialog v-model="providerVisible" :title="provider.id ? '编辑数据源' : '新增数据源'" width="min(760px, 94vw)" destroy-on-close>
     <el-form label-width="130px" :model="provider">
       <el-form-item label="Provider 名称" required><el-input v-model="provider.provider" placeholder="例如 builtin-company-search" /></el-form-item>
       <el-form-item label="Provider 类型"><el-select v-model="provider.type" style="width: 100%"><el-option v-for="item in providerTypes" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
@@ -238,8 +236,8 @@
     <template #footer><el-button @click="providerVisible = false">取消</el-button><el-button type="primary" :loading="providerSaving" @click="saveProvider">保存</el-button></template>
   </el-dialog>
 
-  <el-dialog v-model="roleVisible" :title="roleForm.id ? '编辑角色' : '新增角色'" width="560px">
-    <el-form label-width="110px"><el-form-item label="角色名称"><el-input v-model="roleForm.name" :disabled="Boolean(roleForm.id)" /></el-form-item><el-form-item label="权限 JSON"><el-input v-model="roleForm.permissions" type="textarea" :rows="12" placeholder='{"brands":["read","write"]}' /></el-form-item></el-form>
+  <el-dialog v-model="roleVisible" :title="roleForm.id ? '编辑角色' : '新增角色'" width="min(680px, 94vw)">
+    <el-form label-position="top"><el-form-item label="角色名称"><el-input v-model="roleForm.name" :disabled="Boolean(roleForm.id)" placeholder="例如：销售主管" /></el-form-item><el-form-item label="可使用的功能"><div class="permission-list"><label v-for="item in permissionOptions" :key="item.resource" class="permission-row"><span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span><el-checkbox-group v-model="roleForm.permissions[item.resource]"><el-checkbox v-for="action in item.actions" :key="action.value" :label="action.value">{{ action.label }}</el-checkbox></el-checkbox-group></label></div></el-form-item></el-form>
     <template #footer><el-button @click="roleVisible = false">取消</el-button><el-button type="primary" @click="saveRole">保存</el-button></template>
   </el-dialog>
 
@@ -250,7 +248,7 @@
 
   <el-dialog v-model="tagVisible" title="新增标签" width="420px"><el-form label-width="90px"><el-form-item label="名称"><el-input v-model="tagForm.name" /></el-form-item><el-form-item label="对象"><el-select v-model="tagForm.module" style="width: 100%"><el-option v-for="item in moduleOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item></el-form><template #footer><el-button @click="tagVisible = false">取消</el-button><el-button type="primary" @click="saveTag">保存</el-button></template></el-dialog>
 
-  <el-dialog v-model="customFieldVisible" title="新增自定义字段" width="480px"><el-form label-width="100px"><el-form-item label="字段名称"><el-input v-model="customFieldForm.name" /></el-form-item><el-form-item label="对象"><el-select v-model="customFieldForm.module" style="width: 100%"><el-option v-for="item in moduleOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="字段类型"><el-select v-model="customFieldForm.type" style="width: 100%"><el-option v-for="item in fieldTypes" :key="item" :label="item" :value="item" /></el-select></el-form-item><el-form-item label="必填"><el-switch v-model="customFieldForm.is_required" /></el-form-item><el-form-item label="可筛选"><el-switch v-model="customFieldForm.is_searchable" /></el-form-item><el-form-item label="列表展示"><el-switch v-model="customFieldForm.show_in_list" /></el-form-item></el-form><template #footer><el-button @click="customFieldVisible = false">取消</el-button><el-button type="primary" @click="saveCustomField">保存</el-button></template></el-dialog>
+  <el-dialog v-model="customFieldVisible" title="新增自定义字段" width="min(480px, 94vw)"><el-form label-position="top"><el-form-item label="字段名称"><el-input v-model="customFieldForm.name" placeholder="例如：客户等级" /></el-form-item><el-form-item label="用于"><el-select v-model="customFieldForm.module" style="width: 100%"><el-option v-for="item in moduleOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="填写方式"><el-select v-model="customFieldForm.type" style="width: 100%"><el-option v-for="item in fieldTypes" :key="item" :label="fieldTypeLabel(item)" :value="item" /></el-select></el-form-item><el-form-item label="使用规则"><el-checkbox v-model="customFieldForm.is_required">必须填写</el-checkbox><el-checkbox v-model="customFieldForm.is_searchable">可用于筛选</el-checkbox><el-checkbox v-model="customFieldForm.show_in_list">在列表中显示</el-checkbox></el-form-item></el-form><template #footer><el-button @click="customFieldVisible = false">取消</el-button><el-button type="primary" @click="saveCustomField">创建字段</el-button></template></el-dialog>
 </template>
 
 <script setup lang="ts">
@@ -258,8 +256,23 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
 import { api } from '../api/client'
+import { useAuth } from '../stores/auth'
 
-const activeTab = ref('rules')
+const auth = useAuth()
+const canReadSettings = computed(() => auth.hasPermission('settings:read'))
+const canWriteSettings = computed(() => auth.hasPermission('settings:write'))
+const canReadProviders = computed(() => auth.hasPermission('providers:read'))
+const canReadRoles = computed(() => auth.hasPermission('roles:read'))
+const canWriteRoles = computed(() => auth.hasPermission('roles:write'))
+const canReadUsers = computed(() => auth.hasPermission('users:read'))
+const canWriteUsers = computed(() => auth.hasPermission('users:write'))
+const canReadTags = computed(() => auth.hasPermission('tags:read'))
+const canWriteTags = computed(() => auth.hasPermission('tags:write'))
+const canReadCustomFields = computed(() => auth.hasPermission('custom_fields:read'))
+const canWriteCustomFields = computed(() => auth.hasPermission('custom_fields:write'))
+const canReadAudit = computed(() => auth.hasPermission('audit:read'))
+const firstAllowedTab = () => canReadSettings.value ? 'rules' : canReadProviders.value ? 'providers' : (canReadUsers.value || canReadRoles.value) ? 'access' : (canReadTags.value || canReadCustomFields.value) ? 'metadata' : 'audit'
+const activeTab = ref(firstAllowedTab())
 const providerTable = ref<InstanceType<typeof EntityTable>>()
 const roleTable = ref<InstanceType<typeof EntityTable>>()
 const userTable = ref<InstanceType<typeof EntityTable>>()
@@ -270,6 +283,7 @@ const providerAdvancedSections = ref<string[]>([])
 const providerVisible = ref(false)
 const providerSaving = ref(false)
 const rulesSaving = ref(false)
+const pageLoading = ref(false)
 const roleVisible = ref(false)
 const userVisible = ref(false)
 const tagVisible = ref(false)
@@ -280,19 +294,33 @@ type VendorCredential = { vendor: string; display_name: string; enabled: boolean
 const vendorCredentials = ref<VendorCredential[]>([])
 const vendorKeys = reactive<Record<string, string>>({})
 const vendorsLoading = ref(false)
-const vendorStrategy = reactive({ primary_vendor: 'apollo', fallback_vendors: [] as string[], verification_vendor: 'zerobounce' as string | null, local_verification_mode: 'disabled', local_verification_rollout: 0, local_verification_sample: 10 })
-const searchVendorOptions = [{ label: 'Apollo', value: 'apollo' }, { label: 'Hunter', value: 'hunter' }, { label: 'Prospeo', value: 'prospeo' }]
-const fallbackVendorOptions = computed(() => searchVendorOptions.filter((item) => item.value !== vendorStrategy.primary_vendor))
-
 const systemRules = reactive({ p1: '', p2: '', p3: '', excluded: '', validScore: 70, riskyScore: 40, maxAttempts: 3, retryDelay: 60, maxConcurrency: 4, defaultContactLimit: 5 })
 const aiSettings = reactive({ enabled: false, baseUrl: 'https://api.openai.com/v1', modelName: 'gpt-4o-mini', requestTimeoutSeconds: 60, apiKey: '' })
-const roleForm = reactive({ id: '', name: '', permissions: '{\n  "brands": ["read"]\n}' })
+const roleForm = reactive<{ id: string; name: string; permissions: Record<string, string[]> }>({ id: '', name: '', permissions: {} })
 const userForm = reactive({ id: '', name: '', email: '', password: '', role_id: '', status: 'active' })
 const tagForm = reactive({ name: '', module: 'brands' })
 const customFieldForm = reactive({ name: '', module: 'brands', type: 'text', is_required: false, is_searchable: true, show_in_list: true })
 
 const moduleOptions = [{ label: '品牌', value: 'brands' }, { label: '联系人', value: 'contacts' }, { label: '邮箱', value: 'emails' }]
 const fieldTypes = ['text', 'number', 'date', 'single_select', 'multi_select', 'boolean', 'url', 'email', 'phone']
+const fieldTypeLabels: Record<string, string> = { text: '文本', number: '数字', date: '日期', single_select: '单选', multi_select: '多选', boolean: '是/否', url: '网址', email: '邮箱', phone: '电话' }
+const permissionOptions = [
+  { resource: 'brands', label: '品牌', description: '查看、编辑和导出品牌资料', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '导出', value: 'export' }] },
+  { resource: 'contacts', label: '联系人', description: '查看、编辑和导出联系人', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '导出', value: 'export' }] },
+  { resource: 'emails', label: '邮箱', description: '管理、验证和导出邮箱', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '验证', value: 'verify' }, { label: '导出', value: 'export' }] },
+  { resource: 'tasks', label: '任务', description: '创建、修改和运行搜索任务', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '运行', value: 'execute' }] },
+  { resource: 'providers', label: '数据服务', description: '管理第三方数据源和密钥', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'settings', label: '系统设置', description: '查看或修改全局业务规则', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'users', label: '用户', description: '管理系统登录用户', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'roles', label: '角色', description: '管理角色及其权限', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'audit', label: '审计日志', description: '查看系统操作记录', actions: [{ label: '查看', value: 'read' }] },
+  { resource: 'tags', label: '标签', description: '管理品牌、联系人和邮箱标签', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'custom_fields', label: '自定义字段', description: '管理业务对象的扩展字段', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  { resource: 'import', label: '导入', description: '导入业务数据', actions: [{ label: '执行', value: 'execute' }] },
+  { resource: 'export', label: '统一导出', description: '执行系统级数据导出', actions: [{ label: '执行', value: 'execute' }] },
+  { resource: 'dedup', label: '数据去重', description: '执行重复数据清理', actions: [{ label: '执行', value: 'execute' }] },
+  { resource: 'blacklist', label: '黑名单', description: '查看和维护黑名单', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+]
 const adapterOptions = [{ label: 'HTTP', value: 'http' }, { label: '内置', value: 'builtin' }]
 const providerTypes = [{ label: '企业/品牌搜索', value: 'company_search' }, { label: '联系人搜索', value: 'contact_search' }, { label: '品牌域名邮箱搜索', value: 'brand_email_search' }, { label: '联系人邮箱查找', value: 'email_finder' }, { label: '邮箱验证', value: 'email_verifier' }, { label: '通知', value: 'notification' }]
 const providerColumns: TableColumn[] = [{ key: 'provider', label: '名称', width: 170 }, { key: 'type', label: '类型', width: 150 }, { key: 'enabled', label: '启用', width: 90 }, { key: 'priority', label: '优先级', width: 90 }, { key: 'config', label: '连接配置', width: 360 }]
@@ -446,20 +474,25 @@ async function loadRules() {
   } catch (error) { ElMessage.error((error as Error).message) }
 }
 
+async function reloadCurrentTab() {
+  pageLoading.value = true
+  try {
+    if (activeTab.value === 'rules') await loadRules()
+    else if (activeTab.value === 'providers') await Promise.all([loadVendorSettings(), providerTable.value?.load()])
+    else if (activeTab.value === 'access') await Promise.all([canReadRoles.value ? loadRoles() : Promise.resolve(), canReadRoles.value ? roleTable.value?.load() : Promise.resolve(), canReadUsers.value ? userTable.value?.load() : Promise.resolve()])
+    else if (activeTab.value === 'metadata') await Promise.all([canReadTags.value ? tagTable.value?.load() : Promise.resolve(), canReadCustomFields.value ? customFieldTable.value?.load() : Promise.resolve()])
+    ElMessage.success('已刷新')
+  } finally { pageLoading.value = false }
+}
+
+watch(activeTab, () => { void reloadCurrentTab() })
+
 async function loadVendorSettings() {
   vendorsLoading.value = true
   try {
-    const [credentials, strategy] = await Promise.all([api.get('/vendor-credentials'), api.get('/vendor-strategy')])
+    const credentials = await api.get('/vendor-credentials')
     vendorCredentials.value = credentials.data || []
     for (const item of vendorCredentials.value) vendorKeys[item.vendor] = ''
-    Object.assign(vendorStrategy, {
-      primary_vendor: strategy.data.primary_vendor || 'apollo',
-      fallback_vendors: strategy.data.fallback_vendors || [],
-      verification_vendor: strategy.data.verification_vendor || null,
-      local_verification_mode: strategy.data.local_verification_mode || 'disabled',
-      local_verification_rollout: strategy.data.local_verification_rollout ?? 0,
-      local_verification_sample: strategy.data.local_verification_sample ?? 10,
-    })
   } catch (error) { ElMessage.error((error as Error).message) } finally { vendorsLoading.value = false }
 }
 
@@ -486,15 +519,9 @@ async function testVendor(row: VendorCredential) {
   } catch (error) { ElMessage.error((error as Error).message) }
 }
 
-async function saveVendorStrategy() {
-  try {
-    vendorStrategy.fallback_vendors = vendorStrategy.fallback_vendors.filter((vendor) => vendor !== vendorStrategy.primary_vendor)
-    await api.put('/vendor-strategy', vendorStrategy)
-    ElMessage.success('Vendor 策略已保存，新启动任务将使用该顺序')
-  } catch (error) { ElMessage.error((error as Error).message) }
-}
-
 async function saveRules() {
+  if (systemRules.riskyScore > systemRules.validScore) return ElMessage.warning('风险邮箱分数不能高于有效邮箱分数')
+  if (aiSettings.enabled && (!aiSettings.baseUrl.trim() || !aiSettings.modelName.trim())) return ElMessage.warning('启用 AI 前请填写 API 地址和模型')
   rulesSaving.value = true
   try {
     await api.patch('/system-settings', { title_dictionary: { p1: lines(systemRules.p1), p2: lines(systemRules.p2), p3: lines(systemRules.p3), excluded: lines(systemRules.excluded) }, email_rules: { valid_score: systemRules.validScore, risky_score: systemRules.riskyScore }, task_rules: { max_attempts: systemRules.maxAttempts, retry_delay_seconds: systemRules.retryDelay, max_concurrency: systemRules.maxConcurrency, default_contact_limit: systemRules.defaultContactLimit }, ai: { enabled: aiSettings.enabled, provider: 'openai_compatible', base_url: aiSettings.baseUrl, model_name: aiSettings.modelName, request_timeout_seconds: aiSettings.requestTimeoutSeconds, api_key: aiSettings.apiKey } })
@@ -507,14 +534,14 @@ async function loadRoles() {
 }
 
 function openRole(row?: any) {
-  Object.assign(roleForm, row ? { id: row.id, name: row.name, permissions: JSON.stringify(row.permissions || {}, null, 2) } : { id: '', name: '', permissions: '{\n  "brands": ["read"]\n}' })
+  Object.assign(roleForm, row ? { id: row.id, name: row.name, permissions: normalizePermissions(row.permissions) } : { id: '', name: '', permissions: { brands: ['read'], contacts: ['read'], emails: ['read'], tasks: ['read'] } })
   roleVisible.value = true
 }
 
 async function saveRole() {
   if (!roleForm.name.trim()) return ElMessage.warning('请填写角色名称')
   try {
-    const permissions = parseObject(roleForm.permissions)
+    const permissions = Object.fromEntries(Object.entries(roleForm.permissions).filter(([, actions]) => actions.length))
     if (roleForm.id) await api.patch(`/roles/${roleForm.id}`, { permissions })
     else await api.post('/roles', { name: roleForm.name, permissions })
     roleVisible.value = false
@@ -535,7 +562,13 @@ async function saveUser() {
       const payload: Record<string, unknown> = { name: userForm.name, role_id: userForm.role_id || null, status: userForm.status }
       if (userForm.password) payload.password = userForm.password
       await api.patch(`/users/${userForm.id}`, payload)
-    } else await api.post('/users', { ...userForm, role_id: userForm.role_id || null })
+    } else await api.post('/users', {
+      name: userForm.name.trim(),
+      email: userForm.email.trim(),
+      password: userForm.password,
+      role_id: userForm.role_id || null,
+      status: userForm.status,
+    })
     userVisible.value = false
     await userTable.value?.load()
     ElMessage.success('用户已保存')
@@ -658,12 +691,19 @@ function parseJson(value: string): any { try { return JSON.parse(value) } catch 
 function parseObject(value: string): Record<string, any> { const parsed = parseJson(value); if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('必须填写 JSON 对象'); return parsed }
 function lines(value: string) { return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) }
 function linesToText(value: unknown) { return Array.isArray(value) ? value.join('\n') : '' }
-function compact(value: unknown) { return value ? JSON.stringify(value) : '-' }
 function providerTypeLabel(value: string) { return providerTypes.find((item) => item.value === value)?.label || value }
+function providerSummary(row: any) { const config = row.config || {}; return `${adapterOptions.find((item) => item.value === config.adapter)?.label || config.adapter || 'HTTP'} · ${config.endpoint_url || config.url || '未填写接口地址'}` }
+function moduleLabel(value: string) { return moduleOptions.find((item) => item.value === value)?.label || value }
+function fieldTypeLabel(value: string) { return fieldTypeLabels[value] || value }
+function normalizePermissions(value: unknown) { const result: Record<string, string[]> = {}; if (!value || Array.isArray(value) || typeof value !== 'object') return result; for (const [resource, actions] of Object.entries(value)) result[resource] = Array.isArray(actions) ? actions.map(String) : [String(actions)]; return result }
+function permissionSummary(value: unknown) { const permissions = normalizePermissions(value); const labels = permissionOptions.filter((item) => permissions[item.resource]?.length).map((item) => item.label); return labels.length ? `${labels.slice(0, 4).join('、')}${labels.length > 4 ? `等 ${labels.length} 项` : ''}` : '无额外权限' }
+function auditActionLabel(value: string) { const action = value?.split('.').pop() || ''; return ({ create: '创建', update: '修改', delete: '删除', test: '测试', enable: '启用', disable: '停用' } as Record<string, string>)[action] || value }
+function auditEntityLabel(value: string) { return ({ role: '角色', user: '用户', provider: '数据源', system_setting: '系统设置', tag: '标签', custom_field: '自定义字段' } as Record<string, string>)[value] || value }
+function auditChangeSummary(value: unknown) { if (!value) return '无'; if (typeof value !== 'object') return String(value); const keys = Object.keys(value as object); return keys.length ? `修改了 ${keys.length} 个字段：${keys.slice(0, 3).join('、')}${keys.length > 3 ? '…' : ''}` : '无字段变化' }
 function scrollAdapters(direction: number) { adapterScroller.value?.scrollBy({ left: direction * 280, behavior: 'smooth' }) }
 function scrollAdaptersByWheel(event: WheelEvent) { scrollAdapters(event.deltaY > 0 ? 1 : -1) }
 
-onMounted(async () => { await Promise.all([loadRules(), loadRoles(), loadVendorSettings()]) })
+onMounted(async () => { await reloadCurrentTab() })
 </script>
 
 <style scoped>
@@ -672,6 +712,86 @@ onMounted(async () => { await Promise.all([loadRules(), loadRoles(), loadVendorS
   color: #b42318;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.settings-tabs :deep(.el-tabs__header) {
+  margin-bottom: 18px;
+}
+
+.section-help {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 0 20px;
+  margin-top: 18px;
+}
+
+.settings-grid--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settings-grid :deep(.el-input-number) {
+  width: 100%;
+}
+
+.grid-span-full {
+  grid-column: 1 / -1;
+}
+
+.sticky-actions {
+  position: sticky;
+  bottom: 12px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 8px;
+  padding: 14px 16px;
+  border: 1px solid #dbe3ec;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+}
+
+.permission-list {
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.permission-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(260px, 1.2fr);
+  align-items: center;
+  gap: 16px;
+  padding: 13px 16px;
+  border-bottom: 1px solid #eef2f6;
+}
+
+.permission-row:last-child {
+  border-bottom: 0;
+}
+
+.permission-row strong,
+.permission-row small {
+  display: block;
+}
+
+.permission-row small {
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 12px;
 }
 
 .adapter-picker {
@@ -702,5 +822,29 @@ onMounted(async () => { await Promise.all([loadRules(), loadRoles(), loadVendorS
 
 .provider-advanced :deep(.el-collapse-item__content) {
   padding-top: 16px;
+}
+
+@media (max-width: 760px) {
+  .page-heading,
+  .panel-heading,
+  .sticky-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-grid--two,
+  .settings-grid--three {
+    grid-template-columns: 1fr;
+  }
+
+  .permission-row {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .provider-advanced {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 </style>

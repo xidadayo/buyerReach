@@ -102,7 +102,11 @@ def test_apollo_company_search_converts_filters_and_normalizes_response(monkeypa
             "country": "US",
             "headquarters_country": "US",
             "country_scope": "headquarters",
+            "country_evidence": "apollo_response",
             "category": "Apparel",
+            "industry": "Apparel",
+            "industry_source": "apollo_company_profile",
+            "industry_confidence": 85,
         }
     ]
     assert captured["request"].get_header("X-api-key") == "token"
@@ -147,6 +151,8 @@ def test_apollo_company_search_uses_accounts_when_organizations_are_empty(monkey
     assert result.ok is True
     assert result.data["companies"][0]["brand_name"] == "MANGO"
     assert result.data["companies"][0]["domain"] == "mango.com"
+    assert result.data["companies"][0]["industry_source"] is None
+    assert result.data["companies"][0]["industry_confidence"] is None
 
 
 def test_apollo_brand_discovery_uses_category_tags_instead_of_company_name(monkeypatch):
@@ -195,6 +201,40 @@ def test_apollo_brand_discovery_uses_category_tags_instead_of_company_name(monke
     assert body["page"] == 3
     assert "q_organization_name" not in body
     assert captured["timeout"] == 30
+
+
+def test_apollo_single_hq_filter_supplies_country_evidence_when_response_omits_it(
+    monkeypatch,
+):
+    def fake_urlopen(_request, timeout):
+        assert timeout == 30
+        return FakeResponse(
+            {
+                "organizations": [
+                    {"name": "Italian Bags", "primary_domain": "bags.example"}
+                ]
+            }
+        )
+
+    monkeypatch.setattr(vendors, "urlopen", fake_urlopen)
+    provider = SimpleNamespace(provider="apollo-company", type="company_search")
+    result = vendors.execute_vendor_provider(
+        provider,
+        {
+            "mode": "brand_discovery",
+            "categories": ["bag"],
+            "countries": ["意大利"],
+        },
+        {
+            "adapter": "apollo",
+            "endpoint_url": "https://configured.example/companies",
+            "api_key": "token",
+        },
+    )
+
+    company = result.data["companies"][0]
+    assert company["headquarters_country"] == "Italy"
+    assert company["country_evidence"] == "apollo_organization_locations_filter"
 
 
 def test_apollo_brand_discovery_translates_chinese_search_filters(monkeypatch):
@@ -346,6 +386,22 @@ def test_hunter_discover_does_not_copy_requested_country_without_provider_eviden
     assert result.ok is True
     assert result.data["companies"][0]["country"] is None
     assert result.data["companies"][0]["headquarters_country"] is None
+
+
+def test_hunter_discover_exposes_only_actual_provider_industry() -> None:
+    company = vendors._hunter_discover_company(
+        {"domain": "moda.example", "organization": "Moda", "industry": "Apparel"},
+        {"categories": ["handbags"]},
+        "Companies in handbags industry",
+        {},
+        1,
+        100,
+    )
+
+    assert company["category"] == "Apparel"
+    assert company["industry"] == "Apparel"
+    assert company["industry_source"] == "hunter_company_profile"
+    assert company["industry_confidence"] == 80
 
 
 def test_hunter_discover_translates_chinese_search_filters_to_english(monkeypatch):
@@ -582,6 +638,8 @@ def test_apollo_bulk_enrichment_uses_configured_endpoint(monkeypatch):
                         "last_name": "Doe",
                         "title": "Buyer",
                         "email": "jane@acme.com",
+                        "email_status": "verified",
+                        "email_source": "apollo_native",
                     }
                 ]
             }
@@ -608,6 +666,14 @@ def test_apollo_bulk_enrichment_uses_configured_endpoint(monkeypatch):
 
     assert result.ok is True
     assert result.data["contacts"][0]["emails"] == ["jane@acme.com"]
+    assert result.data["contacts"][0]["email_details"] == [
+        {
+            "address": "jane@acme.com",
+            "verification_status": "verified",
+            "verification_source": "apollo_native",
+            "verification_provider": "apollo",
+        }
+    ]
     assert (
         captured["request"].full_url
         == "https://configured.example/bulk-match?reveal_personal_emails=False"

@@ -19,6 +19,7 @@ class VendorWorkflowAdapter:
     configs: dict[str, dict[str, Any]]
     verification_only: bool = False
     capabilities: dict[str, Any] | None = None
+    adapter_version: str = ADAPTER_VERSION
 
     def provider(
         self, provider_type: str, api_key: str, *, priority: int = 100
@@ -35,13 +36,7 @@ class VendorWorkflowAdapter:
                 **config,
                 "adapter": self.vendor,
                 "api_key": api_key,
-                "adapter_version": (
-                    "hunter-v11"
-                    if self.vendor == "hunter"
-                    else "apollo-v8"
-                    if self.vendor == "apollo"
-                    else ADAPTER_VERSION
-                ),
+                "adapter_version": self.adapter_version,
                 "capabilities": self.capabilities or {},
             },
         )
@@ -88,6 +83,7 @@ _APOLLO_QUOTA = {
 APOLLO = VendorWorkflowAdapter(
     vendor="apollo",
     display_name="Apollo",
+    adapter_version="apollo-v8",
     supported_types=frozenset({"company_search", "contact_search"}),
     capabilities={
         "supports_industry_include": True,
@@ -129,6 +125,7 @@ _HUNTER_QUOTA = {
 HUNTER = VendorWorkflowAdapter(
     vendor="hunter",
     display_name="Hunter",
+    adapter_version="hunter-v11",
     supported_types=frozenset(
         {"company_search", "contact_search", "brand_email_search", "email_finder", "email_verifier"}
     ),

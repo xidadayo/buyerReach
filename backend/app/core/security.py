@@ -6,7 +6,7 @@ from jose import jwt
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.modules.models import User
+from app.modules.models import Role, User
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -66,6 +66,59 @@ def has_permission(role_name: str, permission: str) -> bool:
     if "admin:*" in perms:
         return True
     return permission in perms
+
+
+def flatten_permissions(value: dict) -> set[str]:
+    permissions: set[str] = set()
+    for resource, actions in value.items():
+        if isinstance(actions, list):
+            permissions.update(f"{resource}:{action}" for action in actions)
+        elif isinstance(actions, str):
+            permissions.add(f"{resource}:{actions}")
+    return permissions
+
+
+def get_user_permissions(db: Session, user: User) -> set[str]:
+    role_name = "viewer"
+    role = db.get(Role, user.role_id) if user.role_id else None
+    if role is not None:
+        role_name = role.name
+    permissions = get_role_permissions(role_name)
+    if role is not None:
+        permissions = permissions | flatten_permissions(role.permissions or {})
+    return permissions
+
+
+def get_role_effective_permissions(db: Session, role_id: object | None) -> set[str]:
+    role = db.get(Role, role_id) if role_id else None
+    role_name = role.name if role is not None else "viewer"
+    permissions = get_role_permissions(role_name)
+    if role is not None:
+        permissions = permissions | flatten_permissions(role.permissions or {})
+    return permissions
+
+
+def permissions_dominate(actor_permissions: set[str], target_permissions: set[str]) -> bool:
+    """Return true when the actor may manage a principal with the target permissions."""
+    return "admin:*" in actor_permissions or target_permissions <= actor_permissions
+
+
+def can_assign_role(db: Session, actor: User, role_id: object | None) -> bool:
+    return permissions_dominate(
+        get_user_permissions(db, actor),
+        get_role_effective_permissions(db, role_id),
+    )
+
+
+def can_manage_user(db: Session, actor: User, target: User) -> bool:
+    actor_permissions = get_user_permissions(db, actor)
+    if "admin:*" not in actor_permissions:
+        if actor.organization_id != target.organization_id:
+            return False
+    return permissions_dominate(
+        actor_permissions,
+        get_role_effective_permissions(db, target.role_id),
+    )
 
 
 # ---------------------------------------------------------------------------

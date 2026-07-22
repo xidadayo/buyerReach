@@ -51,7 +51,7 @@ def get_or_create_draft_plan(
     existing = db.scalar(
         select(SearchQueryPlan)
         .where(
-            SearchQueryPlan.task_id == str(task.id),
+            SearchQueryPlan.task_id == task.id,
             SearchQueryPlan.status == "draft",
         )
         .order_by(SearchQueryPlan.version.desc())
@@ -81,7 +81,7 @@ def get_or_create_draft_plan(
 
     plan = SearchQueryPlan(
         id=uuid4(),
-        task_id=str(task.id),
+        task_id=task.id,
         organization_id=str(task.organization_id) if task.organization_id else None,
         version=1,
         generator_type=generator_type,
@@ -104,8 +104,7 @@ def get_or_create_draft_plan(
 
 
 def get_plan(db: Session, task_id: UUID, version: int | None = None) -> dict | None:
-    task_id_str = str(task_id)
-    stmt = select(SearchQueryPlan).where(SearchQueryPlan.task_id == task_id_str)
+    stmt = select(SearchQueryPlan).where(SearchQueryPlan.task_id == task_id)
     if version is not None:
         stmt = stmt.where(SearchQueryPlan.version == version)
     else:

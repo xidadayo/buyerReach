@@ -13,7 +13,18 @@
     <el-button link type="primary" @click="downloadLastExport">再次下载</el-button>
   </div>
   <div class="panel">
-    <EntityTable ref="table" endpoint="/contacts" :columns="columns" selectable @selection-change="onSelectionChange">
+    <div class="contact-search" role="search" aria-label="搜索联系人">
+      <el-input
+        v-model="searchInput"
+        clearable
+        placeholder="搜索姓名、职位、品牌、邮箱或 LinkedIn"
+        aria-label="联系人搜索关键词"
+        @keyup.enter="applySearch"
+        @clear="applySearch"
+      />
+      <el-button type="primary" @click="applySearch">搜索</el-button>
+    </div>
+    <EntityTable ref="table" endpoint="/contacts" :columns="columns" :query-params="contactQuery" selectable @selection-change="onSelectionChange">
       <template #cell-linkedin_url="{ value }">
         <a v-if="value" :href="value" target="_blank" rel="noreferrer">LinkedIn</a><span v-else>-</span>
       </template>
@@ -50,7 +61,7 @@
 
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { onBeforeUnmount, reactive, ref } from 'vue'
+import { nextTick, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
 import { api } from '../api/client'
@@ -63,6 +74,8 @@ const archiving = ref(false)
 const exporting = ref(false)
 const brands = ref<any[]>([])
 const selectedRows = ref<Record<string, any>[]>([])
+const searchInput = ref('')
+const contactQuery = ref<Record<string, string>>({})
 const lastExport = ref<{ count: number; filename: string; url: string } | null>(null)
 const form = reactive({ brand_id: '', first_name: '', last_name: '', title: '', linkedin_url: '' })
 const columns: TableColumn[] = [
@@ -115,6 +128,14 @@ async function save() {
 
 function onSelectionChange(rows: Record<string, any>[]) {
   selectedRows.value = rows
+}
+
+async function applySearch() {
+  const search = searchInput.value.trim()
+  contactQuery.value = search ? { search } : {}
+  selectedRows.value = []
+  await nextTick()
+  await table.value?.reloadFromFirstPage()
 }
 
 function viewEmails(row: Record<string, any>) {
@@ -171,4 +192,10 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .export-status { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; color: var(--el-text-color-regular); }
+.contact-search { display: flex; gap: 10px; max-width: 620px; margin-bottom: 16px; }
+.contact-search .el-input { flex: 1; }
+@media (max-width: 640px) {
+  .contact-search { flex-direction: column; max-width: none; }
+  .contact-search .el-button { width: 100%; margin-left: 0; }
+}
 </style>

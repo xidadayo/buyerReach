@@ -9,6 +9,7 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    get_user_permissions,
     hash_password,
     verify_password,
 )
@@ -64,6 +65,7 @@ class UserProfile(BaseModel):
     role: str | None
     organization_name: str | None
     status: str
+    permissions: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
             "role": role_name,
             "organization_name": org_name,
             "status": user.status,
+            "permissions": sorted(get_user_permissions(db, user)),
         },
     }
 
@@ -181,6 +184,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         "role": role_name,
         "organization_name": org_name,
         "status": user.status,
+        "permissions": sorted(get_user_permissions(db, user)),
     }
 
 

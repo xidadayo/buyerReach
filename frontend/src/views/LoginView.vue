@@ -17,6 +17,7 @@
             prefix-icon="el-icon"
             size="large"
             clearable
+            autocomplete="username"
           />
         </el-form-item>
         <el-form-item>
@@ -26,6 +27,7 @@
             placeholder="请输入密码"
             show-password
             size="large"
+            autocomplete="current-password"
             @keyup.enter="doLogin"
           />
         </el-form-item>
@@ -40,7 +42,6 @@
           登录
         </el-button>
       </el-form>
-      <p class="login-hint">默认账号: admin@buyerreach.local / admin123</p>
     </el-card>
   </div>
 </template>
@@ -52,8 +53,8 @@ import { useAuth } from '../stores/auth'
 
 const auth = useAuth()
 const router = useRouter()
-const email = ref('admin@buyerreach.local')
-const password = ref('admin123')
+const email = ref('')
+const password = ref('')
 
 async function doLogin() {
   const ok = await auth.login(email.value, password.value)

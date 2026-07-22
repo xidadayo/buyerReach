@@ -12,6 +12,14 @@
         <a v-if="value" :href="value" target="_blank" rel="noreferrer">{{ value }}</a>
         <span v-else>-</span>
       </template>
+      <template #cell-category="{ value }">
+        <span v-if="value">{{ value }}</span>
+        <el-tag v-else type="info" effect="plain">待获取</el-tag>
+      </template>
+      <template #cell-discovery_score="{ value, row }">
+        <span v-if="row.relevance_status === 'evaluated'">{{ value }}</span>
+        <el-tag v-else type="info" effect="plain">待评估</el-tag>
+      </template>
       <template #cell-email_count="{ value, row }">
         <router-link
           v-if="Number(value) > 0"
@@ -24,7 +32,6 @@
         <span v-else>0</span>
       </template>
       <template #actions="{ row }">
-        <el-button v-if="row.status === 'pending_review'" size="small" type="success" :loading="approvingId === row.id" @click="approveDiscovery(row)">批准并丰富</el-button>
         <el-button size="small" @click="openEdit(row)">编辑</el-button>
         <el-button
           v-if="row.primary_website"
@@ -32,7 +39,7 @@
           :loading="parsingId === row.id"
           @click="parseWebsite(row)"
         >
-          解析官网
+          {{ row.category ? '解析官网' : '获取官网行业' }}
         </el-button>
         <el-button size="small" type="danger" plain @click="archive(row)">归档</el-button>
       </template>
@@ -61,6 +68,8 @@
         <el-descriptions-item label="域名">{{ parseResult.domain }}</el-descriptions-item>
         <el-descriptions-item label="邮箱数">{{ parseResult.emails?.length || 0 }}</el-descriptions-item>
         <el-descriptions-item label="电话数">{{ parseResult.phones?.length || 0 }}</el-descriptions-item>
+        <el-descriptions-item label="行业">{{ parseResult.industry || '未识别' }}</el-descriptions-item>
+        <el-descriptions-item label="相关性">{{ parseResult.industry ? parseResult.discovery_score : '待评估' }}</el-descriptions-item>
       </el-descriptions>
       <div v-if="parseResult.emails?.length" style="margin-top: 16px">
         <h4>发现邮箱</h4>
@@ -80,6 +89,7 @@
         </div>
       </div>
       <el-alert v-if="parseResult.error" :title="parseResult.error" type="warning" show-icon style="margin-top: 12px" />
+      <el-alert v-else-if="parseResult.industry_error" :title="parseResult.industry_error" type="info" show-icon style="margin-top: 12px" />
     </template>
   </el-dialog>
 </template>
@@ -96,7 +106,6 @@ const saving = ref(false)
 const archiving = ref(false)
 const editingId = ref('')
 const parsingId = ref('')
-const approvingId = ref('')
 const parseResult = ref<any>(null)
 const parseVisible = ref(false)
 const selectedRows = ref<Record<string, any>[]>([])
@@ -167,25 +176,13 @@ async function archiveSelected() {
   }
 }
 
-async function approveDiscovery(row: any) {
-  approvingId.value = row.id
-  try {
-    const { data } = await api.post(`/brands/${row.id}/approve-discovery`)
-    ElMessage.success(`已批准候选品牌，并创建丰富任务 ${data.task_id}`)
-    await table.value?.load()
-  } catch (error) {
-    ElMessage.error((error as Error).message)
-  } finally {
-    approvingId.value = ''
-  }
-}
-
 async function parseWebsite(row: any) {
   parsingId.value = row.id
   try {
     const { data } = await api.post(`/brands/${row.id}/parse-website`)
     parseResult.value = data
     parseVisible.value = true
+    await table.value?.load()
     if (data.emails?.length) {
       ElMessage.success(`从官网解析到 ${data.emails.length} 个邮箱`)
     } else if (data.error) {

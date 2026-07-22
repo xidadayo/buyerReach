@@ -11,6 +11,7 @@ interface UserInfo {
   role: string | null
   organization_name: string | null
   status: string
+  permissions: string[]
 }
 
 interface AuthState {
@@ -108,5 +109,7 @@ export function useAuth() {
     refreshAccessToken,
     changePassword,
     isAuthenticated: () => !!state.token,
+    hasPermission: (permission: string) => state.user?.permissions?.includes('admin:*') || state.user?.permissions?.includes(permission) || false,
+    hasAnyPermission: (permissions: string[]) => permissions.some((permission) => state.user?.permissions?.includes('admin:*') || state.user?.permissions?.includes(permission)),
   }
 }

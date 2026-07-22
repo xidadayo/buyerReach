@@ -3,20 +3,28 @@
     <h1 class="page-title">搜索任务</h1>
     <div>
       <el-button @click="aiDialogVisible = true">AI 协调任务</el-button>
-      <el-button type="primary" @click="quickCreateVisible = true">快速创建</el-button>
-      <el-button @click="dialogVisible = true">高级创建</el-button>
+      <el-button v-if="batchExactBrandEnabled" @click="$router.push('/batch-exact-brand')">批量精准品牌</el-button>
+      <el-button type="primary" @click="dialogVisible = true">创建任务</el-button>
     </div>
   </div>
 
   <div class="panel">
     <EntityTable ref="table" endpoint="/search-tasks" :columns="columns">
+      <template #cell-mode="{ value }">
+        {{ modeLabel(value) }}
+      </template>
       <template #cell-status="{ row }">
         <el-tag :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
       </template>
-      <template #cell-progress="{ value }">
-        <span v-if="value?.discovered !== undefined">候选 {{ value.discovered }} · 新增 {{ value.new_candidates || 0 }} · 刷新 {{ value.refreshed_candidates || 0 }}</span>
-        <span v-else>品牌 {{ value?.brands || 0 }} · 联系人 {{ value?.contacts || 0 }} · 邮箱 {{ value?.emails || 0 }}</span>
-        <el-tag v-if="value?.partial_failure_count" type="warning" size="small" style="margin-left: 8px">部分查询失败 {{ value.partial_failure_count }}</el-tag>
+      <template #cell-progress="{ row, value }">
+        <template v-if="row.mode === 'batch_exact_brand'">
+          <span>目标 {{ value?.targets_total || 0 }} · 已完成 {{ value?.targets_completed || 0 }}</span>
+          <el-tag v-if="value?.targets_failed > 0" type="danger" size="small" style="margin-left: 8px">失败 {{ value.targets_failed }}</el-tag>
+        </template>
+        <template v-else>
+          <span>品牌 {{ value?.brands || 0 }} · 联系人 {{ value?.contacts || 0 }} · 邮箱 {{ value?.emails || 0 }}</span>
+          <el-tag v-if="value?.partial_failure_count" type="warning" size="small" style="margin-left: 8px">部分查询失败 {{ value.partial_failure_count }}</el-tag>
+        </template>
       </template>
       <template #actions="{ row }">
         <el-button
@@ -32,14 +40,6 @@
         <el-button v-if="canCancel(row.status)" size="small" type="danger" plain @click="cancel(row.id)">取消</el-button>
         <el-button size="small" @click="copy(row.id)">复制</el-button>
         <el-button size="small" @click="showDetail(row)">详情</el-button>
-        <el-button
-          v-if="row.pipeline_version === '2.0.0' || row.mode === 'brand_discovery'"
-          size="small"
-          plain
-          @click="openPlanDrawer(row.id)"
-        >
-          切片
-        </el-button>
       </template>
     </EntityTable>
   </div>
@@ -48,7 +48,7 @@
     <el-form label-width="110px" :model="form">
       <el-form-item label="任务名称" required><el-input v-model="form.name" /></el-form-item>
       <el-form-item label="任务模式">
-        <el-segmented v-model="form.mode" :options="modes" />
+        <el-segmented v-model="form.mode" :options="modes" @change="loadVendorCapabilities" />
       </el-form-item>
       <el-form-item v-if="form.mode === 'exact_brand'" label="目标品牌" required>
         <el-input v-model="keywords" type="textarea" :rows="3" placeholder="填写一个已知目标品牌，例如 MANGO" />
@@ -68,18 +68,24 @@
       </el-form-item>
       <el-form-item v-if="form.mode === 'brand_discovery'" label="最低相关性"><el-input-number v-model="form.min_relevance" :min="0" :max="100" /></el-form-item>
       <el-form-item label="数据来源">
-        <el-checkbox-group v-model="vendorPipelines">
-          <el-checkbox label="apollo">Apollo</el-checkbox>
-          <el-checkbox label="hunter">Hunter</el-checkbox>
-        </el-checkbox-group>
+        <el-radio-group v-model="vendorExecutionMode">
+          <el-radio-button value="apollo_only" :disabled="!vendorAvailable('apollo')">仅 Apollo</el-radio-button>
+          <el-radio-button value="hunter_only" :disabled="!vendorAvailable('hunter')">仅 Hunter</el-radio-button>
+          <el-radio-button value="apollo_hunter" :disabled="!vendorAvailable('apollo') || !vendorAvailable('hunter')">Apollo + Hunter</el-radio-button>
+        </el-radio-group>
         <el-text size="small" type="info" style="margin-top: 4px">
-          选中的来源独立执行完整搜索（公司 → 联系人 → 邮箱）。不选则使用系统默认策略。
+          选中的来源会独立执行公司、联系人和邮箱流程；双来源会增加调用量和费用。
         </el-text>
       </el-form-item>
-      <el-form-item v-if="form.mode === 'exact_brand'" label="目标职位">
+      <el-form-item label="目标职位">
         <el-input v-model="titles" placeholder="多个职位用逗号分隔" />
       </el-form-item>
-      <el-form-item label="品牌上限"><el-input-number v-model="form.brand_limit" :min="1" :max="5000" /></el-form-item>
+      <el-form-item label="联系人上限">
+        <el-input-number v-model="contactsLimitPerBrand" :min="1" :max="50" />
+      </el-form-item>
+      <el-form-item v-if="form.mode === 'brand_discovery'" label="品牌上限">
+        <el-input-number v-model="form.brand_limit" :min="1" :max="5000" />
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="dialogVisible = false">取消</el-button>
@@ -124,23 +130,28 @@
         <el-descriptions-item label="目标品类">
           <el-input v-model="aiDraft.categories" placeholder="多个品类用逗号分隔" />
         </el-descriptions-item>
-        <el-descriptions-item label="品牌数量上限">
+        <el-descriptions-item v-if="aiPlan.task.mode === 'brand_discovery'" label="品牌数量上限">
           <el-input-number v-model="aiDraft.brandLimit" :min="1" :max="5000" controls-position="right" />
         </el-descriptions-item>
-        <el-descriptions-item v-if="aiPlan.task.mode === 'exact_brand'" label="每品牌联系人上限">
+        <el-descriptions-item label="数据来源" :span="2">
+          <el-radio-group v-model="vendorExecutionMode">
+            <el-radio-button value="apollo_only" :disabled="!vendorAvailable('apollo')">仅 Apollo</el-radio-button>
+            <el-radio-button value="hunter_only" :disabled="!vendorAvailable('hunter')">仅 Hunter</el-radio-button>
+            <el-radio-button value="apollo_hunter" :disabled="!vendorAvailable('apollo') || !vendorAvailable('hunter')">Apollo + Hunter</el-radio-button>
+          </el-radio-group>
+        </el-descriptions-item>
+        <el-descriptions-item label="每品牌联系人上限">
           <el-input-number v-model="aiDraft.contactsLimitPerBrand" :min="1" :max="50" controls-position="right" />
         </el-descriptions-item>
         <el-descriptions-item v-if="aiPlan.task.mode === 'brand_discovery'" label="最低相关度">
           <el-input-number v-model="aiDraft.minRelevance" :min="0" :max="100" controls-position="right" />
         </el-descriptions-item>
-        <el-descriptions-item v-if="aiPlan.task.mode === 'exact_brand'" label="目标职位" :span="2">
+        <el-descriptions-item label="目标职位" :span="2">
           <el-input v-model="aiDraft.targetTitles" type="textarea" :rows="2" placeholder="多个职位用逗号分隔" />
         </el-descriptions-item>
       </el-descriptions>
       <el-text type="info" size="small">
-        {{ aiPlan.task.mode === 'brand_discovery'
-          ? '品牌数量上限控制最终保留的候选品牌数；联系人将在候选品牌审核通过后补充。'
-          : '数量上限控制最终保留的品牌数，以及每个品牌最多补充的联系人数量。' }}
+        数量上限控制最终保留的品牌数，以及每个合格品牌最多补充的联系人数量。
       </el-text>
       <div style="margin-top: 14px"><strong>执行步骤</strong><ol><li v-for="step in aiPlan.steps" :key="step">{{ step }}</li></ol></div>
       <el-alert v-for="warning in aiPlan.warnings" :key="warning" :title="warning" type="warning" :closable="false" show-icon style="margin-top: 8px" />
@@ -152,89 +163,11 @@
     </template>
   </el-dialog>
 
-  <!-- Quick-create dialog -->
-  <el-dialog v-model="quickCreateVisible" title="快速创建搜索任务" width="560px" top="4vh">
-    <div style="margin-bottom: 20px">
-      <el-text size="small" type="info">
-        描述目标商家，选择数量，系统自动生成查询计划并开始搜索。
-      </el-text>
-    </div>
-    <el-form label-width="100px">
-      <el-form-item label="搜索预设">
-        <el-segmented v-model="quickPreset" :options="presetOptions" />
-      </el-form-item>
-      <el-form-item label="目标描述" required>
-        <el-input
-          v-model="quickPrompt"
-          type="textarea"
-          :rows="3"
-          maxlength="2000"
-          show-word-limit
-          placeholder="例如：寻找意大利和法国的女包品牌、零售商及进口商"
-        />
-      </el-form-item>
-      <el-form-item label="目标商家数">
-        <el-input-number v-model="quickTargetCount" :min="10" :max="5000" :step="50" />
-        <el-text size="small" type="info" style="margin-left: 8px">
-          合格商家目标，非原始返回数量
-        </el-text>
-      </el-form-item>
-      <el-form-item label="目标国家">
-        <el-input v-model="quickCountries" placeholder="可选；无法从描述识别时建议填写，如 IT, FR" />
-      </el-form-item>
-    </el-form>
-
-    <!-- Preview result -->
-    <div v-if="quickPreview" style="margin-top: 16px">
-      <el-alert
-        :title="quickPreview.summary"
-        type="success"
-        :closable="false"
-        show-icon
-      />
-      <div v-if="quickPreview.warnings?.length" style="margin-top: 8px">
-        <el-alert
-          v-for="w in quickPreview.warnings"
-          :key="w"
-          :title="String(w)"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 4px"
-        />
-      </div>
-      <div style="margin-top: 8px; font-size: 13px; color: var(--el-text-color-secondary)">
-        预计 {{ quickPreview.slices?.length || 0 }} 个查询方向 ·
-        约 {{ quickPreview.estimated_provider_calls || 0 }} 次外部调用
-      </div>
-    </div>
-
-    <template #footer>
-      <el-button @click="quickCreateVisible = false">取消</el-button>
-      <el-button :loading="quickCreating" @click="doQuickCreate">
-        仅创建任务（稍后启动）
-      </el-button>
-      <el-button
-        type="primary"
-        :loading="quickCreating"
-        @click="doQuickCreateAndStart"
-      >
-        创建并开始搜索
-      </el-button>
-    </template>
-  </el-dialog>
-
-  <!-- Query Plan Drawer -->
-  <QueryPlanDrawer
-    v-model="planDrawerVisible"
-    :task-id="selectedTaskId"
-    @locked="onPlanLocked"
-  />
-
   <!-- Task detail drawer -->
-  <el-drawer v-model="detailVisible" title="任务详情" size="520px">
+  <el-drawer v-model="detailVisible" title="任务详情" size="580px">
     <el-descriptions v-if="selected" :column="1" border>
       <el-descriptions-item label="任务 ID">{{ selected.id }}</el-descriptions-item>
+      <el-descriptions-item label="模式">{{ modeLabel(selected.mode) }}</el-descriptions-item>
       <el-descriptions-item label="状态">{{ statusLabel(selected.status) }}</el-descriptions-item>
       <el-descriptions-item label="错误信息">{{ selected.error_message || '-' }}</el-descriptions-item>
       <el-descriptions-item label="筛选条件"><pre>{{ JSON.stringify(selected.filters, null, 2) }}</pre></el-descriptions-item>
@@ -242,29 +175,57 @@
     <template v-if="taskPlan">
       <el-divider>Vendor 执行计划</el-divider>
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="主平台">{{ taskPlan.primary_vendor }}</el-descriptions-item>
-        <el-descriptions-item label="备用顺序">{{ taskPlan.fallback_vendors?.join(' → ') || '无' }}</el-descriptions-item>
-        <el-descriptions-item label="邮箱验证">{{ taskPlan.verification_vendor || '无' }}</el-descriptions-item>
+        <el-descriptions-item label="执行模式">{{ executionModeLabel(taskPlan.execution_mode) }}</el-descriptions-item>
+        <el-descriptions-item label="选中来源">{{ taskPlan.selected_vendors?.join(' + ') || '无' }}</el-descriptions-item>
         <el-descriptions-item label="Adapter 版本">{{ taskPlan.adapter_version }}</el-descriptions-item>
       </el-descriptions>
     </template>
-    <el-divider>阶段执行与恢复点</el-divider>
-    <el-table :data="taskCheckpoints" size="small" max-height="300">
-      <el-table-column prop="stage" label="阶段" min-width="130" />
-      <el-table-column prop="vendor" label="平台" width="95" />
-      <el-table-column prop="status" label="状态" width="90"><template #default="{ row }"><el-tag :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
-      <el-table-column prop="attempts" label="次数" width="65" />
-      <el-table-column label="结果" width="80"><template #default="{ row }">{{ checkpointCount(row) }}</template></el-table-column>
-      <el-table-column prop="error_message" label="切换/失败原因" min-width="190" show-overflow-tooltip />
-    </el-table>
-    <el-divider>任务明细</el-divider>
-    <el-table :data="taskItems" size="small" max-height="360">
-      <el-table-column prop="entity_type" label="对象" width="90" />
-      <el-table-column prop="stage" label="阶段" min-width="140" />
-      <el-table-column prop="status" label="状态" width="100" />
-      <el-table-column prop="provider" label="Provider" min-width="130" />
-      <el-table-column prop="error_message" label="错误" min-width="180" show-overflow-tooltip />
-    </el-table>
+
+    <!-- Batch target details -->
+    <template v-if="selected?.mode === 'batch_exact_brand'">
+      <el-divider>批量目标进度</el-divider>
+      <el-table :data="batchTargets" size="small" max-height="320" v-loading="batchTargetsLoading">
+        <el-table-column prop="row_number" label="#" width="50" />
+        <el-table-column prop="company_name" label="公司" min-width="140" show-overflow-tooltip />
+        <el-table-column prop="normalized_domain" label="域名" min-width="150" show-overflow-tooltip />
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag :type="batchStatusType(row.execution_status)" size="small">
+              {{ batchStatusLabel(row.execution_status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="reliable_email_count" label="可靠邮箱" width="80" />
+        <el-table-column label="操作" width="90">
+          <template #default="{ row }">
+            <el-button
+              v-if="['failed','retryable'].includes(row.execution_status)"
+              size="small" type="warning" @click="retrySingleTarget(row.id)"
+            >重试</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </template>
+
+    <template v-if="selected?.mode !== 'batch_exact_brand'">
+      <el-divider>阶段执行与恢复点</el-divider>
+      <el-table :data="taskCheckpoints" size="small" max-height="300">
+        <el-table-column prop="stage" label="阶段" min-width="130" />
+        <el-table-column prop="vendor" label="平台" width="95" />
+        <el-table-column prop="status" label="状态" width="90"><template #default="{ row }"><el-tag :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+        <el-table-column prop="attempts" label="次数" width="65" />
+        <el-table-column label="结果" width="80"><template #default="{ row }">{{ checkpointCount(row) }}</template></el-table-column>
+        <el-table-column prop="error_message" label="切换/失败原因" min-width="190" show-overflow-tooltip />
+      </el-table>
+      <el-divider>任务明细</el-divider>
+      <el-table :data="taskItems" size="small" max-height="360">
+        <el-table-column prop="entity_type" label="对象" width="90" />
+        <el-table-column prop="stage" label="阶段" min-width="140" />
+        <el-table-column prop="status" label="状态" width="100" />
+        <el-table-column prop="provider" label="Provider" min-width="130" />
+        <el-table-column prop="error_message" label="错误" min-width="180" show-overflow-tooltip />
+      </el-table>
+    </template>
   </el-drawer>
 </template>
 
@@ -272,9 +233,7 @@
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
-import QueryPlanDrawer from '../components/QueryPlanDrawer.vue'
 import { api } from '../api/client'
-import { safeCandidateStatus } from '../api/compat'
 
 const table = ref<InstanceType<typeof EntityTable>>()
 const dialogVisible = ref(false)
@@ -303,7 +262,10 @@ const keywords = ref('')
 const officialDomains = ref('')
 const countries = ref('')
 const categories = ref('')
-const vendorPipelines = ref<string[]>([])
+const vendorExecutionMode = ref<'apollo_only' | 'hunter_only' | 'apollo_hunter'>('apollo_hunter')
+const vendorCapabilities = ref<Record<string, any>>({})
+const batchExactBrandEnabled = ref(false)
+const contactsLimitPerBrand = ref(5)
 const titles = ref('Head of Buying,Sourcing Manager')
 const form = reactive({ name: '', mode: 'brand_discovery', brand_limit: 100, min_relevance: 45, category_match_mode: 'any' })
 const modes = [
@@ -319,91 +281,34 @@ const columns: TableColumn[] = [
   { key: 'created_at', label: '创建时间', width: 180 },
 ]
 
-// ── Quick-create state ──────────────────────────────────────────────────────
-const quickCreateVisible = ref(false)
-const quickPrompt = ref('')
-const quickTargetCount = ref(100)
-const quickCountries = ref('')
-const quickPreset = ref('balanced')
-const quickPreview = ref<any>(null)
-const quickCreating = ref(false)
-const presetOptions = [
-  { label: '精准优先', value: 'precision' },
-  { label: '均衡', value: 'balanced' },
-  { label: '扩大探索', value: 'volume' },
-]
+function selectedVendors() {
+  if (vendorExecutionMode.value === 'apollo_only') return ['apollo']
+  if (vendorExecutionMode.value === 'hunter_only') return ['hunter']
+  return ['apollo', 'hunter']
+}
 
-// ── Plan drawer state ──────────────────────────────────────────────────────
-const planDrawerVisible = ref(false)
-const selectedTaskId = ref('')
+function vendorAvailable(vendor: string) {
+  return vendorCapabilities.value[vendor]?.available !== false
+}
 
-async function doQuickCreate() {
-  if (quickPrompt.value.trim().length < 4) {
-    ElMessage.warning('请至少输入 4 个字符的目标描述')
-    return
-  }
-  quickCreating.value = true
+async function loadVendorCapabilities() {
   try {
-    // Build a task create payload from the quick-create form
-    const payload: any = {
-      name: quickPrompt.value.trim().slice(0, 80),
-      mode: 'brand_discovery',
-      original_prompt: quickPrompt.value.trim(),
-      brand_limit: quickTargetCount.value,
-      countries: splitComma(quickCountries.value),
-      categories: [quickPrompt.value.trim()],
-      min_relevance: quickPreset.value === 'precision' ? 55 : quickPreset.value === 'volume' ? 35 : 45,
-    }
-    await api.post('/search-tasks', payload)
-    quickCreateVisible.value = false
-    quickPrompt.value = ''
-    quickPreview.value = null
-    ElMessage.success('任务已创建，请在列表中选择启动')
-    await table.value?.load()
-  } catch (error: any) {
-    ElMessage.error(error.message)
-  } finally {
-    quickCreating.value = false
+    const { data } = await api.get('/vendor-capabilities', { params: { task_mode: form.mode } })
+    vendorCapabilities.value = Object.fromEntries(
+      (Array.isArray(data) ? data : []).map((item: any) => [item.vendor, item]),
+    )
+  } catch {
+    vendorCapabilities.value = {}
   }
 }
 
-async function doQuickCreateAndStart() {
-  if (quickPrompt.value.trim().length < 4) {
-    ElMessage.warning('请至少输入 4 个字符的目标描述')
-    return
-  }
-  quickCreating.value = true
+async function loadBatchExactBrandCapability() {
   try {
-    const payload: any = {
-      name: quickPrompt.value.trim().slice(0, 80),
-      mode: 'brand_discovery',
-      original_prompt: quickPrompt.value.trim(),
-      brand_limit: quickTargetCount.value,
-      countries: splitComma(quickCountries.value),
-      categories: [quickPrompt.value.trim()],
-      min_relevance: quickPreset.value === 'precision' ? 55 : quickPreset.value === 'volume' ? 35 : 45,
-    }
-    const { data: task } = await api.post('/search-tasks', payload)
-    await api.post(`/search-tasks/${task.id}/start`)
-    quickCreateVisible.value = false
-    quickPrompt.value = ''
-    quickPreview.value = null
-    ElMessage.success('任务已创建并进入队列')
-    await table.value?.load()
-  } catch (error: any) {
-    ElMessage.error(error.message)
-  } finally {
-    quickCreating.value = false
+    const { data } = await api.get('/batch-exact-brand/capabilities')
+    batchExactBrandEnabled.value = data?.enabled === true
+  } catch {
+    batchExactBrandEnabled.value = false
   }
-}
-
-function openPlanDrawer(taskId: string) {
-  selectedTaskId.value = taskId
-  planDrawerVisible.value = true
-}
-
-function onPlanLocked(_plan: any) {
-  ElMessage.success('查询计划已锁定，启动任务即可开始搜索')
 }
 
 async function createTask() {
@@ -427,17 +332,24 @@ async function createTask() {
     ElMessage.warning('精准品牌必须填写已确认的官方官网或域名，以排除同名公司')
     return
   }
+  if (!splitComma(titles.value).length) {
+    ElMessage.warning('请至少填写一个目标职位')
+    return
+  }
   saving.value = true
   try {
+    const exactBrandKeywords = form.mode === 'exact_brand' ? splitLines(keywords.value) : []
     await api.post('/search-tasks', {
       ...form,
-      brand_keywords: form.mode === 'exact_brand' ? splitLines(keywords.value) : [],
+      brand_keywords: exactBrandKeywords,
+      brand_limit: form.mode === 'exact_brand' ? exactBrandKeywords.length : form.brand_limit,
       official_domains: splitComma(officialDomains.value),
       countries: splitComma(countries.value),
       categories: splitComma(categories.value),
       category_match_mode: form.category_match_mode,
-      target_titles: form.mode === 'exact_brand' ? splitComma(titles.value) : [],
-      selected_vendors: vendorPipelines.value.length ? vendorPipelines.value : null,
+      target_titles: splitComma(titles.value),
+      contacts_limit_per_brand: contactsLimitPerBrand.value,
+      selected_vendors: selectedVendors(),
     })
     dialogVisible.value = false
     form.name = ''
@@ -495,7 +407,7 @@ async function confirmAiPlan() {
     ElMessage.warning('精准品牌任务必须填写已确认的官方网站或域名')
     return
   }
-  if (task.mode === 'exact_brand' && !task.target_titles.length) {
+  if (!task.target_titles.length) {
     ElMessage.warning('请至少填写一个目标职位')
     return
   }
@@ -520,29 +432,33 @@ function loadAiDraft(task: any) {
   aiDraft.officialDomains = (task?.official_domains || []).join(', ')
   aiDraft.countries = (task?.countries || []).join(', ')
   aiDraft.categories = (task?.categories || []).join(', ')
-  aiDraft.targetTitles = (task?.target_titles || []).join(', ')
+  aiDraft.targetTitles = (task?.target_titles?.length
+    ? task.target_titles
+    : ['Buyer', 'Head of Buying', 'Sourcing Manager', 'Procurement Manager']).join(', ')
   aiDraft.brandLimit = Number(task?.brand_limit || 100)
   aiDraft.contactsLimitPerBrand = Number(task?.contacts_limit_per_brand || 5)
   aiDraft.minRelevance = Number(task?.min_relevance ?? 45)
 }
 
 function buildAiTaskPayload() {
+  const exactBrandKeywords = aiPlan.value.task.mode === 'exact_brand'
+    ? splitComma(aiDraft.brandKeywords)
+    : []
   return {
     ...aiPlan.value.task,
     original_prompt: aiPrompt.value.trim(),
     search_intent: aiPlan.value.search_intent,
     name: aiDraft.name.trim(),
-    brand_keywords: aiPlan.value.task.mode === 'exact_brand' ? splitComma(aiDraft.brandKeywords) : [],
+    brand_keywords: exactBrandKeywords,
     official_domains: aiPlan.value.task.mode === 'exact_brand' ? splitComma(aiDraft.officialDomains) : [],
     countries: splitComma(aiDraft.countries),
     categories: splitComma(aiDraft.categories),
-    target_titles: aiPlan.value.task.mode === 'exact_brand'
-      ? splitComma(aiDraft.targetTitles)
-      : [],
-    brand_limit: aiDraft.brandLimit,
-    contacts_limit_per_brand: aiPlan.value.task.mode === 'exact_brand'
-      ? aiDraft.contactsLimitPerBrand
-      : aiPlan.value.task.contacts_limit_per_brand,
+    target_titles: splitComma(aiDraft.targetTitles),
+    brand_limit: aiPlan.value.task.mode === 'exact_brand'
+      ? Math.max(exactBrandKeywords.length, 1)
+      : aiDraft.brandLimit,
+    contacts_limit_per_brand: aiDraft.contactsLimitPerBrand,
+    selected_vendors: selectedVendors(),
     min_relevance: aiDraft.minRelevance,
   }
 }
@@ -585,6 +501,11 @@ async function showDetail(row: any) {
   taskPlan.value = checkpointsResponse.data.plan
   taskCheckpoints.value = checkpointsResponse.data.checkpoints || []
   detailVisible.value = true
+
+  // Load batch targets for batch tasks
+  if (taskResponse.data.mode === 'batch_exact_brand') {
+    loadBatchTargets(row.id)
+  }
 }
 
 function checkpointCount(row: any) {
@@ -630,9 +551,14 @@ function splitLines(value: string) {
 function splitComma(value: string) {
   return value.split(/[\r\n,，、;；]+/).map((item) => item.trim()).filter(Boolean)
 }
+function modeLabel(value: string) {
+  return ({ brand_discovery: '品牌发现', exact_brand: '精准品牌', excel_import: 'Excel 导入', batch_exact_brand: '批量精准品牌' } as Record<string, string>)[value] || value
+}
 function statusLabel(value: string) {
-  value = safeCandidateStatus(value)
   return ({ draft: '草稿', queued: '排队中', running: '执行中', paused: '已暂停', completed: '已完成', failed: '失败', partial: '部分完成', cancelled: '已取消' } as Record<string, string>)[value] || value
+}
+function executionModeLabel(value: string) {
+  return ({ apollo_only: '仅 Apollo', hunter_only: '仅 Hunter', apollo_hunter: 'Apollo + Hunter' } as Record<string, string>)[value] || value || '未知'
 }
 function statusType(value: string) {
   if (value === 'completed') return 'success'
@@ -651,7 +577,53 @@ function canRerun(value: string) {
   return ['completed', 'cancelled'].includes(value)
 }
 
+// ── Batch target helpers ──────────────────────────────────────────────────
+const batchTargets = ref<any[]>([])
+const batchTargetsLoading = ref(false)
+
+async function loadBatchTargets(taskId: string) {
+  batchTargetsLoading.value = true
+  try {
+    const { data } = await api.get(`/search-tasks/${taskId}/targets`, { params: { page_size: 200 } })
+    batchTargets.value = data.items || []
+  } catch {
+    batchTargets.value = []
+  } finally {
+    batchTargetsLoading.value = false
+  }
+}
+
+function batchStatusLabel(status: string) {
+  const map: Record<string, string> = {
+    pending: '等待中', queued: '排队中', running: '执行中', completed: '已完成',
+    no_match: '未找到', partial: '部分完成', retryable: '可重试', failed: '失败', cancelled: '已取消',
+  }
+  return map[status] || status
+}
+
+function batchStatusType(status: string) {
+  if (status === 'completed') return 'success'
+  if (status === 'running') return 'warning'
+  if (['failed', 'retryable'].includes(status)) return 'danger'
+  return ''
+}
+
+async function retrySingleTarget(targetId: string) {
+  if (!selected.value) return
+  try {
+    await api.post(`/search-tasks/${selected.value.id}/targets/retry`, { target_ids: [targetId] })
+    ElMessage.success('已重新排队')
+    await loadBatchTargets(selected.value.id)
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || error.message || '重试失败')
+  }
+}
+
 let timer: number | undefined
-onMounted(() => { timer = window.setInterval(() => table.value?.load(), 5000) })
+onMounted(() => {
+  loadVendorCapabilities()
+  loadBatchExactBrandCapability()
+  timer = window.setInterval(() => table.value?.load(), 5000)
+})
 onUnmounted(() => { if (timer) window.clearInterval(timer) })
 </script>

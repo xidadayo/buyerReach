@@ -41,7 +41,15 @@ api.interceptors.response.use(
       return Promise.reject(error)
     }
     const detail = error.response?.data?.detail
-    const message = typeof detail === 'string' ? detail : error.message || '请求失败'
+    const validationMessage = Array.isArray(detail)
+      ? detail.map((item: any) => {
+          const field = Array.isArray(item?.loc) ? item.loc.filter((part: unknown) => part !== 'body').join('.') : ''
+          return `${field ? `${field}: ` : ''}${item?.msg || '参数格式错误'}`
+        }).join('；')
+      : ''
+    const message = typeof detail === 'string'
+      ? detail
+      : validationMessage || error.message || '请求失败'
     return Promise.reject(new Error(message))
   },
 )

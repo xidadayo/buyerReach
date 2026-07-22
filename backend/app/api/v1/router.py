@@ -15,6 +15,7 @@ from app.core.deps import require_permission, require_task_access
 from app.modules import services
 from app.modules.models import (
     AuditLog,
+    BatchImport,
     Blacklist,
     Brand,
     Contact,
@@ -34,6 +35,7 @@ from app.modules.models import (
 from app.modules.schemas import (
     AITaskPlanRead,
     AITaskPlanRequest,
+    BatchImportConfirm,
     BlacklistCreate,
     BrandBatchRequest,
     BrandCreate,
@@ -64,10 +66,10 @@ from app.modules.schemas import (
     SystemSettingsUpdate,
     TagCreate,
     TagUpdate,
+    TargetRetryRequest,
     UserCreate,
     UserUpdate,
     VendorCredentialUpdate,
-    VendorStrategyUpdate,
 )
 from app.modules.tabular import read_rows
 from app.shared.enums import TaskStatus
@@ -410,7 +412,7 @@ def continue_new(
 
     existing_plan = db.scalar(
         select(SearchQueryPlan)
-        .where(SearchQueryPlan.task_id == str(task_id))
+        .where(SearchQueryPlan.task_id == task_id)
         .order_by(SearchQueryPlan.version.desc())
         .limit(1)
     )
@@ -423,13 +425,13 @@ def continue_new(
 
     max_version = db.scalar(
         select(func.max(SearchQueryPlan.version)).where(
-            SearchQueryPlan.task_id == str(task_id)
+            SearchQueryPlan.task_id == task_id
         )
     ) or 0
     new_version = max_version + 1
     new_plan = SearchQueryPlan(
-        id=str(uuid4()),
-        task_id=str(task.id),
+        id=uuid4(),
+        task_id=task.id,
         organization_id=str(task.organization_id) if task.organization_id else None,
         version=new_version,
         generator_type="user",
@@ -470,7 +472,6 @@ def get_vendor_capabilities(
 ) -> list[dict]:
     """Return which vendors are available, enabled, and what stages they support."""
     from app.modules.models import VendorCredential
-    from app.core.crypto import decrypt_provider_config
 
     credentials = {
         item.vendor: item
@@ -497,12 +498,19 @@ def get_vendor_capabilities(
     for vendor_key, info in vendor_defs.items():
         cred = credentials.get(vendor_key)
         enabled = cred is not None
-        reason = None if enabled else "API key not configured or vendor disabled"
+        available = enabled and cred.last_test_ok is not False
+        reason = (
+            None
+            if available
+            else "Connection test failed"
+            if enabled
+            else "API key not configured or vendor disabled"
+        )
         result.append({
             "vendor": info["vendor"],
             "display_name": info["display_name"],
             "enabled": enabled,
-            "available": enabled,
+            "available": available,
             "unavailable_reason": reason,
             "supported_stages": info["stages"],
             "email_method": info["email_method"],
@@ -546,6 +554,11 @@ def create_search_task(
     user: User = require_permission("tasks:write"),
     db: Session = Depends(get_db),
 ) -> SearchTask:
+    if payload.mode != "excel_import" and not payload.selected_vendors:
+        raise HTTPException(
+            status_code=422,
+            detail="Select Apollo, Hunter, or both before creating the task",
+        )
     task = services.create_search_task(
         db, payload, organization_id=user.organization_id, owner_id=user.id
     )
@@ -1194,9 +1207,12 @@ def list_contacts(
     user: User = require_permission("contacts:read"),
     page: int = 1,
     page_size: int = 50,
+    search: str | None = Query(default=None, max_length=200),
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_contacts(db, page, page_size)
+    return services.list_contacts(
+        db, page, page_size, search=search, organization_id=user.organization_id
+    )
 
 
 @api_router.post("/contacts", status_code=status.HTTP_201_CREATED)
@@ -1205,7 +1221,7 @@ def create_contact(
     user: User = require_permission("contacts:write"),
     db: Session = Depends(get_db),
 ) -> dict:
-    contact = services.create_contact(db, payload)
+    contact = services.create_contact(db, payload, organization_id=user.organization_id)
     db.commit()
     db.refresh(contact)
     return services.to_dict(contact)
@@ -1502,6 +1518,306 @@ async def preview_import_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# ── Batch Exact Brand ────────────────────────────────────────────────────────
+
+
+@api_router.get("/batch-exact-brand/capabilities")
+async def batch_exact_brand_capabilities(
+    user: User = require_permission("tasks:read"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Expose the rollout state so clients can hide disabled entry points."""
+    from app.modules.batch_exact_brand import is_batch_exact_brand_enabled
+
+    return {"enabled": is_batch_exact_brand_enabled(db)}
+
+
+@api_router.get("/batch-exact-brand/template")
+async def download_batch_template(
+    user: User = require_permission("tasks:read"),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Download the versioned CSV template for batch exact brand import."""
+    from app.modules.batch_exact_brand import generate_template_csv, is_batch_exact_brand_enabled
+
+    if not is_batch_exact_brand_enabled(db):
+        raise HTTPException(status_code=404, detail="批量精准品牌功能当前未启用")
+
+    content = generate_template_csv()
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=exact-brand-import-v1.csv",
+        },
+    )
+
+
+@api_router.post("/batch-exact-brand/preview")
+async def preview_batch_import(
+    file: UploadFile = File(...),
+    user: User = require_permission("import:execute"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Parse and validate an uploaded file, returning a read-only preview.
+
+    No SearchTask, Target, or Vendor calls are made.
+    """
+    from app.modules.batch_exact_brand import build_preview, is_batch_exact_brand_enabled
+
+    if not is_batch_exact_brand_enabled(db):
+        raise HTTPException(status_code=404, detail="批量精准品牌功能当前未启用")
+
+    try:
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="文件大小超过 10 MB 限制")
+
+        result = build_preview(file.filename or "upload.csv", content)
+        if "error" in result:
+            err = result["error"]
+            raise HTTPException(status_code=400, detail=err.get("message", str(err)))
+
+        services.audit(
+            db,
+            "batch_exact_brand.preview",
+            "batch_import",
+            result["file_hash"],
+            after={"filename": file.filename, "total_rows": result["total_rows"]},
+        )
+        db.commit()
+        return result
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"预览解析失败: {str(exc)}") from exc
+
+
+@api_router.post("/batch-exact-brand/imports", status_code=status.HTTP_201_CREATED)
+async def create_batch_import(
+    file: UploadFile = File(...),
+    user: User = require_permission("import:execute"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Upload a file, parse it, and persist a BatchImport record."""
+    from app.modules.batch_exact_brand import (
+        build_preview,
+        create_batch_import,
+        is_batch_exact_brand_enabled,
+    )
+
+    if not is_batch_exact_brand_enabled(db):
+        raise HTTPException(status_code=404, detail="批量精准品牌功能当前未启用")
+
+    try:
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="文件大小超过 10 MB 限制")
+
+        preview = build_preview(file.filename or "upload.csv", content)
+        if "error" in preview:
+            err = preview["error"]
+            raise HTTPException(status_code=400, detail=err.get("message", str(err)))
+
+        batch = create_batch_import(
+            db,
+            filename=file.filename or "upload.csv",
+            file_hash=preview["file_hash"],
+            parsed_rows=preview["rows"],
+            organization_id=user.organization_id,
+            created_by=user.id,
+        )
+        services.audit(
+            db,
+            "batch_exact_brand.upload",
+            "batch_import",
+            str(batch.id),
+            after={"filename": batch.filename, "total_rows": batch.total_rows},
+        )
+        db.commit()
+
+        return {
+            "id": str(batch.id),
+            "filename": batch.filename,
+            "status": batch.status,
+            "total_rows": batch.total_rows,
+            "valid_rows": batch.valid_rows,
+            "warning_rows": batch.warning_rows,
+            "invalid_rows": batch.invalid_rows,
+            "duplicate_rows": batch.duplicate_rows,
+            "error_summary": batch.error_summary,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"导入创建失败: {str(exc)}") from exc
+
+
+@api_router.get("/batch-exact-brand/imports/{batch_id}")
+async def get_batch_import_detail(
+    batch_id: UUID,
+    user: User = require_permission("tasks:read"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Get batch import detail with aggregated target statistics."""
+    from app.modules.batch_exact_brand import get_batch_detail
+
+    batch = db.get(BatchImport, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+    # Org isolation
+    if batch.organization_id is not None and str(batch.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+
+    try:
+        return get_batch_detail(db, batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api_router.post("/batch-exact-brand/imports/{batch_id}/confirm")
+async def confirm_batch_import(
+    batch_id: UUID,
+    payload: BatchImportConfirm,
+    user: User = require_permission("tasks:write"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Confirm a batch import — creates parent SearchTask, Targets, TaskVendorPlan.
+
+    Idempotent: repeated calls return the same parent task without creating duplicates.
+    """
+    from app.modules.batch_exact_brand import confirm_batch_import
+
+    batch = db.get(BatchImport, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+    if batch.organization_id is not None and str(batch.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+
+    try:
+        result = confirm_batch_import(
+            db,
+            batch_id=batch_id,
+            config=payload,
+            organization_id=user.organization_id,
+            user_id=user.id,
+        )
+        db.commit()
+
+        parent_task = result["parent_task"]
+        targets = result["targets"]
+
+        return {
+            "batch_id": str(result["batch"].id),
+            "parent_task_id": str(parent_task.id),
+            "parent_task_name": parent_task.name,
+            "target_count": len(targets),
+            "vendors": payload.selected_vendors,
+            "already_confirmed": result["already_confirmed"],
+        }
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"确认失败: {str(exc)}") from exc
+
+
+@api_router.get("/search-tasks/{task_id}/targets")
+async def list_task_targets(
+    task_id: UUID,
+    user: User = require_permission("tasks:read"),
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    status: str | None = Query(None),
+) -> dict:
+    """List ExactBrandTargets for a parent task."""
+    from app.modules.batch_exact_brand import get_targets_for_task
+
+    require_task_access(db, task_id, user)
+    return get_targets_for_task(db, task_id, page=page, page_size=page_size, status_filter=status)
+
+
+@api_router.post("/search-tasks/{task_id}/targets/retry")
+async def retry_failed_targets(
+    task_id: UUID,
+    payload: TargetRetryRequest,
+    user: User = require_permission("tasks:execute"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Retry specific failed/retryable targets."""
+    from app.modules.batch_exact_brand import retry_targets
+
+    task = require_task_access(db, task_id, user)
+    if task.mode != "batch_exact_brand":
+        raise HTTPException(status_code=400, detail="此操作仅支持批量精准品牌任务")
+
+    try:
+        count = retry_targets(db, task_id=task_id, target_ids=payload.target_ids, user_id=user.id)
+        db.commit()
+        return {"retried": count}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api_router.get("/search-tasks/{task_id}/targets/errors.csv")
+async def export_target_errors_csv(
+    task_id: UUID,
+    user: User = require_permission("export:execute"),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Export error rows as downloadable CSV."""
+    from app.modules.batch_exact_brand import export_target_errors
+
+    require_task_access(db, task_id, user)
+    content = export_target_errors(db, task_id)
+    services.audit(db, "batch_exact_brand.export_errors", "search_task", str(task_id))
+    db.commit()
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8-sig")),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="batch-errors-{task_id}.csv"',
+        },
+    )
+
+
+@api_router.get("/search-tasks/{task_id}/targets/export.csv")
+async def export_reliable_emails_csv(
+    task_id: UUID,
+    user: User = require_permission("export:execute"),
+    db: Session = Depends(get_db),
+    scope: str = Query("verified", pattern="^(verified|reviewable|all)$"),
+) -> StreamingResponse:
+    """Export reliable emails across all completed targets."""
+    from app.modules.batch_exact_brand import export_reliable_emails
+
+    require_task_access(db, task_id, user)
+    content = export_reliable_emails(db, task_id, scope=scope)
+    services.audit(
+        db,
+        "batch_exact_brand.export_emails",
+        "search_task",
+        str(task_id),
+        after={"scope": scope},
+    )
+    db.commit()
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8-sig")),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="reliable-emails-{task_id}.csv"',
+        },
+    )
+
+
 @api_router.post("/exports")
 def export_file(
     payload: ExportRequest,
@@ -1560,26 +1876,6 @@ def test_vendor_credential(
     if credential is None:
         raise HTTPException(status_code=404, detail="Vendor credential not found")
     result = services.test_vendor_credential(db, credential)
-    db.commit()
-    return result
-
-
-@api_router.get("/vendor-strategy")
-def get_vendor_strategy(
-    user: User = require_permission("providers:read"), db: Session = Depends(get_db)
-) -> dict:
-    result = services.get_vendor_strategy(db)
-    db.commit()
-    return result
-
-
-@api_router.put("/vendor-strategy")
-def update_vendor_strategy(
-    payload: VendorStrategyUpdate,
-    user: User = require_permission("providers:write"),
-    db: Session = Depends(get_db),
-) -> dict:
-    result = services.update_vendor_strategy(db, payload)
     db.commit()
     return result
 
@@ -1680,7 +1976,7 @@ def list_roles(
     page_size: int = 50,
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_roles(db, page, page_size)
+    return services.list_roles(db, page, page_size, actor=user)
 
 
 @api_router.post("/roles", status_code=status.HTTP_201_CREATED)
@@ -1689,6 +1985,10 @@ def create_role(
     user: User = require_permission("roles:write"),
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.core.security import flatten_permissions, permissions_dominate, get_user_permissions
+
+    if not permissions_dominate(get_user_permissions(db, user), flatten_permissions(payload.permissions)):
+        raise HTTPException(status_code=403, detail="Cannot create a role with higher permissions")
     try:
         role = services.create_role(db, payload)
         db.commit()
@@ -1705,9 +2005,16 @@ def update_role(
     user: User = require_permission("roles:write"),
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.core.security import get_user_permissions, get_role_effective_permissions, flatten_permissions, permissions_dominate
+
     role = db.get(Role, role_id)
     if role is None:
         raise HTTPException(status_code=404, detail="Role not found")
+    actor_permissions = get_user_permissions(db, user)
+    if not permissions_dominate(actor_permissions, get_role_effective_permissions(db, role.id)):
+        raise HTTPException(status_code=404, detail="Role not found")
+    if not permissions_dominate(actor_permissions, flatten_permissions(payload.permissions)):
+        raise HTTPException(status_code=403, detail="Cannot grant permissions higher than your own")
     services.update_role(db, role, payload)
     db.commit()
     db.refresh(role)
@@ -1721,7 +2028,7 @@ def list_users(
     page_size: int = 50,
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_users(db, page, page_size)
+    return services.list_users(db, page, page_size, actor=user)
 
 
 @api_router.post("/users", status_code=status.HTTP_201_CREATED)
@@ -1730,8 +2037,12 @@ def create_user(
     user: User = require_permission("users:write"),
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.core.security import can_assign_role
+
+    if not can_assign_role(db, user, payload.role_id):
+        raise HTTPException(status_code=403, detail="Cannot assign a role with higher permissions")
     try:
-        created = services.create_user(db, payload)
+        created = services.create_user(db, payload, organization_id=user.organization_id)
         db.commit()
         db.refresh(created)
         result = services.to_dict(created)
@@ -1748,9 +2059,13 @@ def update_user(
     user: User = require_permission("users:write"),
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.core.security import can_assign_role, can_manage_user
+
     target = db.get(User, user_id)
-    if target is None or target.deleted_at is not None:
+    if target is None or target.deleted_at is not None or not can_manage_user(db, user, target):
         raise HTTPException(status_code=404, detail="User not found")
+    if "role_id" in payload.model_fields_set and not can_assign_role(db, user, payload.role_id):
+        raise HTTPException(status_code=403, detail="Cannot assign a role with higher permissions")
     services.update_user(db, target, payload)
     db.commit()
     db.refresh(target)

@@ -2,7 +2,7 @@ import re
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
 from app.modules.brand_discovery import COUNTRY_ALIASES
 
@@ -49,12 +49,8 @@ class SearchTaskCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_selected_vendors(self) -> "SearchTaskCreate":
-        if self.selected_vendors is not None:
-            if len(set(self.selected_vendors)) != len(self.selected_vendors):
-                raise ValueError("selected_vendors contains duplicates")
-            for v in self.selected_vendors:
-                if v not in {"apollo", "hunter"}:
-                    raise ValueError(f"Unknown vendor: {v}")
+        if self.selected_vendors and len(set(self.selected_vendors)) != len(self.selected_vendors):
+            raise ValueError("selected_vendors contains duplicates")
         return self
 
     @model_validator(mode="after")
@@ -85,9 +81,8 @@ class SearchTaskCreate(BaseModel):
             self.countries = countries
             self.categories = categories
             self.brand_keywords = []
-            # Company discovery returns companies only. Contact roles belong to
-            # a later, explicitly requested contact-enrichment task.
-            self.target_titles = []
+            if self.selected_vendors is None:
+                self.target_titles = []
             if not categories:
                 raise ValueError("Brand discovery tasks require at least one target category")
             if not countries:
@@ -303,12 +298,22 @@ class RoleUpdate(BaseModel):
 
 
 class UserCreate(BaseModel):
-    email: EmailStr
+    email: str = Field(min_length=3, max_length=255)
     name: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=8, max_length=128)
     role_id: UUID | None = None
     department_id: UUID | None = None
     status: Literal["active", "disabled"] = "active"
+
+    @field_validator("email")
+    @classmethod
+    def validate_login_email(cls, value: str) -> str:
+        """Accept normal email addresses and the product's internal .local accounts."""
+        normalized = value.strip().casefold()
+        local_pattern = r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.local$"
+        if re.fullmatch(local_pattern, normalized):
+            return normalized
+        return str(TypeAdapter(EmailStr).validate_python(normalized))
 
 
 class UserUpdate(BaseModel):
@@ -357,3 +362,165 @@ class CustomFieldUpdate(BaseModel):
 
 class CustomValueUpsert(BaseModel):
     value: Any
+
+
+# ── Batch Exact Brand (additive, 2026-07-22) ────────────────────────────────
+
+
+class BatchImportRow(BaseModel):
+    """A single parsed row from an upload file before validation."""
+    row_number: int
+    company_name: str
+    official_domain: str
+    country: str | None = None
+    external_id: str | None = None
+    notes: str | None = None
+
+
+class BatchImportParsedRow(BaseModel):
+    """A validated and normalized row returned in the preview."""
+    row_number: int
+    company_name: str
+    normalized_company_name: str
+    official_domain: str
+    normalized_domain: str
+    country: str | None = None
+    external_id: str | None = None
+    notes: str | None = None
+    validation_status: Literal["valid", "warning", "error"]
+    validation_errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BatchImportPreview(BaseModel):
+    """Preview response — read-only, no SearchTask or Target created."""
+    filename: str
+    template_version: str
+    file_hash: str
+    total_rows: int
+    valid_rows: int
+    warning_rows: int
+    invalid_rows: int
+    duplicate_rows: int
+    rows: list[BatchImportParsedRow]
+    error_summary: dict[str, int] = Field(default_factory=dict)
+    limits: dict[str, int] = Field(default_factory=dict)
+
+
+class BatchImportCreate(BaseModel):
+    """Create a BatchImport from an already-previewed file upload."""
+    filename: str
+    template_version: str = "exact-brand-import-v1"
+    file_hash: str
+    parsed_rows: list[BatchImportParsedRow]
+
+
+class BatchImportRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    organization_id: UUID | None = None
+    filename: str
+    template_version: str
+    status: str
+    total_rows: int
+    valid_rows: int
+    warning_rows: int
+    invalid_rows: int
+    duplicate_rows: int
+    error_summary: dict | None = None
+    parent_task_id: UUID | None = None
+    created_at: str | None = None
+    confirmed_at: str | None = None
+
+
+class BatchImportConfirm(BaseModel):
+    """Confirm a batch import — creates parent SearchTask, Targets, and Vendor plans."""
+    name: str = Field(min_length=1, max_length=255)
+    selected_vendors: list[Literal["apollo", "hunter"]] = Field(min_length=1, max_length=2)
+    target_titles: list[str] = Field(
+        default_factory=lambda: ["Buyer", "Head of Buying", "Sourcing Manager", "Procurement Manager"],
+        min_length=1,
+        max_length=100,
+    )
+    contacts_limit_per_brand: int = Field(default=5, ge=1, le=50)
+    reliable_email_only: bool = True
+    skip_existing_brands: bool = False
+    budget_limit: float | None = Field(default=None, ge=0)
+    max_concurrency: int = Field(default=3, ge=1, le=10)
+    retry_limit_per_target: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_vendors(self) -> "BatchImportConfirm":
+        if len(set(self.selected_vendors)) != len(self.selected_vendors):
+            raise ValueError("selected_vendors contains duplicates")
+        return self
+
+
+class ExactBrandTargetRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    batch_import_id: UUID
+    search_task_id: UUID | None = None
+    row_number: int
+    external_id: str | None = None
+    company_name: str
+    normalized_company_name: str
+    official_domain: str
+    normalized_domain: str
+    country: str | None = None
+    notes: str | None = None
+    validation_status: str
+    execution_status: str
+    current_stage: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    brand_id: UUID | None = None
+    contact_count: int
+    reliable_email_count: int
+    review_email_count: int
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ExactBrandTargetList(BaseModel):
+    items: list[ExactBrandTargetRead]
+    total: int
+    page: int
+    page_size: int
+
+
+class BatchImportDetail(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    filename: str
+    template_version: str
+    status: str
+    total_rows: int
+    valid_rows: int
+    warning_rows: int
+    invalid_rows: int
+    duplicate_rows: int
+    parent_task_id: UUID | None = None
+    created_at: str | None = None
+    confirmed_at: str | None = None
+    # Aggregated target stats
+    targets_total: int = 0
+    targets_completed: int = 0
+    targets_running: int = 0
+    targets_pending: int = 0
+    targets_no_match: int = 0
+    targets_failed: int = 0
+    targets_cancelled: int = 0
+    total_reliable_emails: int = 0
+    total_review_emails: int = 0
+
+
+class TargetRetryRequest(BaseModel):
+    target_ids: list[UUID] = Field(min_length=1, max_length=500)
+
+
+class BatchErrorsExport(BaseModel):
+    format: Literal["csv"] = "csv"

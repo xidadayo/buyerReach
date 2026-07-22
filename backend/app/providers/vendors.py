@@ -1466,6 +1466,17 @@ def _apollo_company(item: dict[str, Any], payload: dict[str, Any] | None = None)
     website = item.get("website_url") or item.get("website") or item.get("primary_domain")
     headquarters_country = item.get("organization_country") or item.get("country")
     categories = _provider_search_categories(_strings((payload or {}).get("categories")))
+    requested_countries = _provider_search_countries(
+        _strings((payload or {}).get("countries"))
+    )
+    country_evidence = "apollo_response"
+    if not headquarters_country and len(requested_countries) == 1:
+        # Apollo defines organization_locations as the current employer's HQ
+        # location. Search responses may omit the duplicated country field, so
+        # the applied single-country filter is still valid per-company evidence.
+        headquarters_country = requested_countries[0]
+        country_evidence = "apollo_organization_locations_filter"
+    actual_industry = str(item.get("industry") or item.get("industry_name") or "").strip()
     company = {
         "brand_name": item.get("name") or item.get("organization_name"),
         "legal_name": item.get("legal_name") or item.get("name"),
@@ -1474,7 +1485,11 @@ def _apollo_company(item: dict[str, Any], payload: dict[str, Any] | None = None)
         "country": headquarters_country,
         "headquarters_country": headquarters_country,
         "country_scope": "headquarters",
-        "category": item.get("industry") or item.get("industry_name"),
+        "country_evidence": country_evidence if headquarters_country else None,
+        "category": actual_industry or None,
+        "industry": actual_industry or None,
+        "industry_source": "apollo_company_profile" if actual_industry else None,
+        "industry_confidence": 85 if actual_industry else None,
     }
     if payload and str(payload.get("mode") or "") == "brand_discovery":
         company.update(
@@ -1496,6 +1511,10 @@ def _apollo_contact(item: dict[str, Any]) -> dict[str, Any]:
         for value in (item.get("email"), item.get("work_email"), item.get("personal_email"))
         if str(value or "").strip()
     ]
+    primary_email = str(item.get("email") or "").strip().lower()
+    email_status = str(
+        item.get("email_status") or item.get("email_true_status") or ""
+    ).strip()
     return {
         "provider_person_id": item.get("id") or item.get("person_id"),
         "first_name": item.get("first_name"),
@@ -1505,6 +1524,20 @@ def _apollo_contact(item: dict[str, Any]) -> dict[str, Any]:
         "linkedin_url": item.get("linkedin_url"),
         "email": emails[0] if emails else None,
         "emails": list(dict.fromkeys(emails)),
+        # Apollo's enrichment response attaches these fields to the primary
+        # email. Keep them in the normalized adapter contract so persistence
+        # can use Apollo's own verification conclusion as source evidence.
+        "email_details": [
+            {
+                "address": primary_email,
+                "verification_status": email_status,
+                "verification_source": item.get("email_source")
+                or item.get("source_display_name"),
+                "verification_provider": "apollo",
+            }
+        ]
+        if primary_email and email_status
+        else [],
     }
 
 
@@ -1605,6 +1638,9 @@ def _hunter_discover_company(
         # Never copy the user's requested category into a company field. This is
         # actual Provider data only; absence means the industry is unverified.
         "category": actual_category,
+        "industry": actual_category,
+        "industry_source": "hunter_company_profile" if actual_category else None,
+        "industry_confidence": 80 if actual_category else None,
         "emails_count": int(emails_count.get("total") or 0),
         "semantic_match": True,
         "semantic_category_match": bool(categories),
