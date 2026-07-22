@@ -94,7 +94,7 @@ application services, and checks readiness:
 
 ```sh
 BACKUP_PASSPHRASE='use-a-secret-manager-value' \
-  ./scripts/upgrade.sh v1.1.0
+  sh ./scripts/upgrade.sh v1.1.0
 ```
 
 For a NAS production override and a separately stored environment file:
@@ -103,7 +103,7 @@ For a NAS production override and a separately stored environment file:
 BACKUP_PASSPHRASE='use-a-secret-manager-value' \
 ENV_FILE=/volume1/docker/buyerreach/.env \
 COMPOSE_FILES=docker-compose.yml:/volume1/docker/buyerreach/compose.prod.yml \
-  ./scripts/upgrade.sh v1.1.0
+  sh ./scripts/upgrade.sh v1.1.0
 ```
 
 `COMPOSE_FILES` uses `:` as its separator and its file paths must not contain

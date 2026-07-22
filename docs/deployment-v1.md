@@ -72,7 +72,7 @@ MinIO files should be backed up from the `minio-data` volume or via an S3-compat
 Use a clean Git clone and select an explicit release tag or commit:
 
 ```bash
-BACKUP_PASSPHRASE='read-from-a-password-manager' ./scripts/upgrade.sh v1.1.0
+BACKUP_PASSPHRASE='read-from-a-password-manager' sh ./scripts/upgrade.sh v1.1.0
 ```
 
 The script checks the current database, creates an encrypted PostgreSQL/MinIO
@@ -90,7 +90,7 @@ contain spaces:
 BACKUP_PASSPHRASE='read-from-a-password-manager' \
 ENV_FILE=/volume1/docker/buyerreach/.env \
 COMPOSE_FILES=docker-compose.yml:/volume1/docker/buyerreach/compose.prod.yml \
-  ./scripts/upgrade.sh v1.1.0
+  sh ./scripts/upgrade.sh v1.1.0
 ```
 
 Set `AUDIT_DIR` to persistent NAS storage. Each attempt writes an append-only

@@ -130,7 +130,7 @@ MIGRATION_BEFORE=$(compose run --rm backend alembic current 2>/dev/null | tr '\n
 audit_event preflight_passed "migration_before=$MIGRATION_BEFORE"
 
 echo "Creating encrypted pre-upgrade backup for $PREVIOUS_COMMIT..."
-BACKUP_PASSPHRASE=$BACKUP_PASSPHRASE BACKUP_OUTPUT_FILE=$BACKUP_OUTPUT_FILE ./scripts/backup.sh
+BACKUP_PASSPHRASE=$BACKUP_PASSPHRASE BACKUP_OUTPUT_FILE=$BACKUP_OUTPUT_FILE sh ./scripts/backup.sh
 BACKUP_ARCHIVE=$(cat "$BACKUP_OUTPUT_FILE")
 audit_event backup_created "archive=$BACKUP_ARCHIVE"
 trap - EXIT INT TERM
