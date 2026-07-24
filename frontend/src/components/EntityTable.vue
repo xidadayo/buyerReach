@@ -12,7 +12,7 @@
     style="width: 100%"
     @selection-change="handleSelectionChange"
   >
-    <el-table-column v-if="selectable" type="selection" width="48" />
+    <el-table-column v-if="selectable" type="selection" width="48" :selectable="rowSelectable" />
     <el-table-column
       v-for="column in columns"
       :key="column.key"
@@ -60,12 +60,14 @@ const props = withDefaults(defineProps<{
   queryParams?: Record<string, unknown>
   pageSize?: number
   selectable?: boolean
+  rowSelectable?: (row: Record<string, any>) => boolean
   tableMaxHeight?: string | number
   scrollbarAlwaysOn?: boolean
 }>(), {
   pageSize: 50,
   queryParams: () => ({}),
   selectable: false,
+  rowSelectable: () => true,
   tableMaxHeight: undefined,
   scrollbarAlwaysOn: false,
 })

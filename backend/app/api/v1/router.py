@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.database import SessionLocal
-from app.core.deps import require_permission, require_task_access
+from app.core.deps import get_current_user, require_permission, require_task_access
 from app.modules import services
 from app.modules.models import (
     AuditLog,
@@ -24,6 +24,10 @@ from app.modules.models import (
     DiscoveryCandidateHit,
     DomainEvent,
     EmailAddress,
+    EmailTemplate,
+    OutreachCampaign,
+    SendingAccount,
+    DataImportBatch,
     ProviderConfig,
     Role,
     SearchQueryPlan,
@@ -46,6 +50,8 @@ from app.modules.schemas import (
     CustomFieldCreate,
     CustomFieldUpdate,
     CustomValueUpsert,
+    DataAssignmentRequest,
+    DataShareRequest,
     DedupMergeRequest,
     DiscoveryCandidateReject,
     DiscoveryCandidateApprove,
@@ -56,6 +62,14 @@ from app.modules.schemas import (
     EmailUpdate,
     EmailReviewRequest,
     EmailVerifyRequest,
+    EmailTemplateCreate,
+    EmailTemplatePreview,
+    OutreachAIDraftRequest,
+    OutreachCampaignCreate,
+    OutreachEventIngest,
+    SendingAccountCreate,
+    DataMigrationCreate,
+    DataMigrationApply,
     ExportRequest,
     ProviderConfigCreate,
     ProviderConfigUpdate,
@@ -102,6 +116,291 @@ from app.query_planning.service import (
 api_router = APIRouter()
 
 
+# ---------------------------------------------------------------------------
+# Outreach (explicitly permission gated; no legacy role receives send access)
+# ---------------------------------------------------------------------------
+@api_router.get("/outreach/sending-accounts")
+def list_sending_accounts(
+    user: User = require_permission("outreach:read"), db: Session = Depends(get_db)
+) -> dict:
+    return {
+        "items": [
+            services.to_dict(item)
+            for item in db.scalars(
+                select(SendingAccount)
+                .where(SendingAccount.organization_id == user.organization_id)
+                .order_by(SendingAccount.created_at.desc())
+            ).all()
+        ]
+    }
+
+
+@api_router.post("/outreach/sending-accounts", status_code=status.HTTP_201_CREATED)
+def create_sending_account(
+    payload: SendingAccountCreate,
+    user: User = require_permission("outreach:manage_accounts"),
+    db: Session = Depends(get_db),
+) -> dict:
+    # Deliberately create in review state; credentials and provider activation happen in governed provider configuration.
+    account = SendingAccount(
+        **payload.model_dump(),
+        provider="disabled",
+        status="pending_configuration",
+        organization_id=user.organization_id,
+        department_id=user.organization_unit_id,
+        owner_id=user.id,
+        created_by=user.id,
+    )
+    db.add(account)
+    services.audit(
+        db,
+        "outreach.sending_account.create",
+        "sending_account",
+        str(account.id),
+        after={"from_email": str(payload.from_email), "status": account.status},
+    )
+    db.commit()
+    return services.to_dict(account)
+
+
+@api_router.get("/outreach/templates")
+def list_outreach_templates(
+    user: User = require_permission("outreach:read"), db: Session = Depends(get_db)
+) -> dict:
+    from app.authz.context import authorization_context
+    from app.authz.scope import apply_scope
+
+    ctx = authorization_context(db, user)
+    statement = apply_scope(
+        select(EmailTemplate).where(EmailTemplate.deleted_at.is_(None)),
+        EmailTemplate,
+        db,
+        ctx,
+        "outreach",
+    )
+    return {"items": [services.to_dict(x) for x in db.scalars(statement).all()]}
+
+
+@api_router.post("/outreach/templates", status_code=status.HTTP_201_CREATED)
+def create_outreach_template(
+    payload: EmailTemplateCreate,
+    user: User = require_permission("outreach:draft"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import create_template
+
+    item = create_template(db, payload, user)
+    db.commit()
+    return services.to_dict(item)
+
+
+@api_router.post("/outreach/templates/{template_id}/preview")
+def preview_outreach_template(
+    template_id: UUID,
+    payload: EmailTemplatePreview,
+    user: User = require_permission("outreach:read"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import preview_template
+
+    template = _load_scoped(db, EmailTemplate, template_id, user, "outreach")
+    try:
+        return preview_template(db, template, payload.email_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.post("/outreach/ai-drafts")
+def generate_outreach_ai_draft(
+    payload: OutreachAIDraftRequest,
+    user: User = require_permission("outreach:draft"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import generate_ai_draft
+
+    try:
+        result = generate_ai_draft(db, payload, user)
+        services.audit(
+            db,
+            "outreach.ai_draft.generate",
+            "email_address",
+            str(payload.email_id) if payload.email_id else None,
+            after={"source": result["source"], "evidence_count": len(result["evidence"])},
+        )
+        db.commit()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.get("/outreach/campaigns")
+def list_outreach_campaigns(
+    user: User = require_permission("outreach:read"), db: Session = Depends(get_db)
+) -> dict:
+    from app.authz.context import authorization_context
+    from app.authz.scope import apply_scope
+
+    ctx = authorization_context(db, user)
+    statement = apply_scope(select(OutreachCampaign), OutreachCampaign, db, ctx, "outreach")
+    return {
+        "items": [
+            services.to_dict(x)
+            for x in db.scalars(statement.order_by(OutreachCampaign.created_at.desc())).all()
+        ]
+    }
+
+
+@api_router.post("/outreach/campaigns", status_code=status.HTTP_201_CREATED)
+def create_outreach_campaign(
+    payload: OutreachCampaignCreate,
+    user: User = require_permission("outreach:draft"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import create_campaign
+
+    try:
+        item = create_campaign(db, payload, user)
+        db.commit()
+        return services.to_dict(item)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.post("/outreach/campaigns/{campaign_id}/approve")
+def approve_outreach_campaign(
+    campaign_id: UUID,
+    user: User = require_permission("outreach:review"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import approve_campaign
+
+    campaign = _load_scoped(db, OutreachCampaign, campaign_id, user, "outreach")
+    try:
+        approve_campaign(db, campaign, user)
+        db.commit()
+        return services.to_dict(campaign)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.post("/outreach/campaigns/{campaign_id}/schedule")
+def schedule_outreach_campaign(
+    campaign_id: UUID,
+    user: User = require_permission("outreach:schedule"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import schedule_campaign
+
+    campaign = _load_scoped(db, OutreachCampaign, campaign_id, user, "outreach")
+    try:
+        count = schedule_campaign(db, campaign, user)
+        db.commit()
+        return {"campaign_id": str(campaign.id), "scheduled": count}
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.post("/outreach/events")
+def ingest_outreach_event(
+    payload: OutreachEventIngest,
+    user: User = require_permission("outreach:send"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.outreach import ingest_event
+
+    try:
+        event = ingest_event(db, payload, user)
+        db.commit()
+        return services.to_dict(event)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Legacy data migration: stage -> inspect conflicts -> explicitly apply.
+# ---------------------------------------------------------------------------
+@api_router.post("/data-migrations", status_code=status.HTTP_201_CREATED)
+def stage_data_migration(
+    payload: DataMigrationCreate,
+    user: User = require_permission("data_migrations:preview"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.data_migration import stage
+
+    batch = stage(db, payload, user)
+    db.commit()
+    return {"id": str(batch.id), "status": batch.status, "summary": batch.summary}
+
+
+@api_router.get("/data-migrations/{batch_id}")
+def get_data_migration(
+    batch_id: UUID,
+    user: User = require_permission("data_migrations:read"),
+    db: Session = Depends(get_db),
+) -> dict:
+    batch = db.get(DataImportBatch, batch_id)
+    if not batch or batch.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    from app.modules.models import DataImportRow
+
+    rows = db.scalars(
+        select(DataImportRow)
+        .where(DataImportRow.batch_id == batch.id)
+        .order_by(DataImportRow.row_number)
+    ).all()
+    return {"batch": services.to_dict(batch), "rows": [services.to_dict(row) for row in rows]}
+
+
+@api_router.post("/data-migrations/{batch_id}/apply")
+def apply_data_migration(
+    batch_id: UUID,
+    payload: DataMigrationApply,
+    user: User = require_permission("data_migrations:execute"),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.modules.data_migration import apply
+
+    batch = db.get(DataImportBatch, batch_id)
+    if not batch or batch.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="Migration batch not found")
+    try:
+        result = apply(db, batch, payload.resolutions, user)
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _load_scoped(db: Session, model, entity_id: UUID, user: User, resource: str):
+    from app.authz.context import authorization_context
+    from app.authz.policy import load_scoped_entity
+
+    return load_scoped_entity(
+        db,
+        model,
+        entity_id,
+        authorization_context(db, user),
+        resource=resource,
+        not_found_message=f"{resource.rstrip('s').title()} not found",
+    )
+
+
+def _authorize_scoped_batch(
+    db: Session, model, entity_ids: list[UUID], user: User, resource: str
+) -> list:
+    from app.authz.context import authorization_context
+    from app.authz.policy import authorize_batch
+
+    return authorize_batch(
+        db, model, entity_ids, authorization_context(db, user), resource=resource
+    )
+
+
 @api_router.get("/health")
 def api_health() -> dict[str, str]:
     return {"status": "ok"}
@@ -115,7 +414,7 @@ def api_health() -> dict[str, str]:
 @api_router.post("/ai/task-plans", response_model=AITaskPlanRead)
 def create_ai_task_plan(
     payload: AITaskPlanRequest,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -137,7 +436,7 @@ def create_ai_task_plan(
 )
 def preview_query_plan(
     payload: QueryPlanPreviewRequest,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Generate a preview plan without creating a task."""
@@ -167,9 +466,7 @@ def get_task_query_plans(
     user: User = require_permission("tasks:read"),
     db: Session = Depends(get_db),
 ) -> dict:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    task = require_task_access(db, task_id, user)
 
     plan = get_plan(db, task_id, version=version)
     if plan is None:
@@ -187,12 +484,10 @@ def update_query_plan(
     task_id: UUID,
     version: int,
     payload: QueryPlanUpdate,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    require_task_access(db, task_id, user)
 
     plan = db.scalar(
         select(SearchQueryPlan).where(
@@ -220,12 +515,10 @@ def lock_query_plan(
     task_id: UUID,
     version: int,
     payload: QueryPlanLockRequest,
-    user: User = require_permission("tasks:execute"),
+    user: User = require_permission("tasks:start"),
     db: Session = Depends(get_db),
 ) -> dict:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    task = require_task_access(db, task_id, user)
 
     plan = db.scalar(
         select(SearchQueryPlan).where(
@@ -249,7 +542,9 @@ def lock_query_plan(
 
     try:
         result = lock_plan(
-            db, plan, task,
+            db,
+            plan,
+            task,
             actor_id=str(user.id),
             updated_at_expected=payload.updated_at,
         )
@@ -268,12 +563,10 @@ def create_query_slice(
     task_id: UUID,
     version: int,
     payload: QuerySliceCreate,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    require_task_access(db, task_id, user)
 
     plan = db.scalar(
         select(SearchQueryPlan).where(
@@ -301,12 +594,10 @@ def update_query_slice(
     version: int,
     slice_id: UUID,
     payload: QuerySliceUpdate,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    require_task_access(db, task_id, user)
 
     plan = db.scalar(
         select(SearchQueryPlan).where(
@@ -344,12 +635,10 @@ def remove_query_slice(
     task_id: UUID,
     version: int,
     slice_id: UUID,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:update"),
     db: Session = Depends(get_db),
 ) -> None:
-    task = db.get(SearchTask, task_id)
-    if task is None or str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    require_task_access(db, task_id, user)
 
     plan = db.scalar(
         select(SearchQueryPlan).where(
@@ -404,7 +693,7 @@ def get_slice_runs(
 def continue_new(
     task_id: UUID,
     payload: ContinueNewRequest,
-    user: User = require_permission("tasks:execute"),
+    user: User = require_permission("tasks:start"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Create a new plan version for continued execution without losing history."""
@@ -423,11 +712,12 @@ def continue_new(
     if existing_plan.status == "locked":
         existing_plan.status = "superseded"
 
-    max_version = db.scalar(
-        select(func.max(SearchQueryPlan.version)).where(
-            SearchQueryPlan.task_id == task_id
+    max_version = (
+        db.scalar(
+            select(func.max(SearchQueryPlan.version)).where(SearchQueryPlan.task_id == task_id)
         )
-    ) or 0
+        or 0
+    )
     new_version = max_version + 1
     new_plan = SearchQueryPlan(
         id=uuid4(),
@@ -437,7 +727,9 @@ def continue_new(
         generator_type="user",
         generator_version=None,
         status="draft",
-        target_result_count=payload.target_result_count if hasattr(payload, 'target_result_count') else existing_plan.target_result_count,
+        target_result_count=payload.target_result_count
+        if hasattr(payload, "target_result_count")
+        else existing_plan.target_result_count,
         candidate_fetch_limit=existing_plan.candidate_fetch_limit,
         max_provider_calls=existing_plan.max_provider_calls,
         budget_limit=existing_plan.budget_limit,
@@ -506,16 +798,18 @@ def get_vendor_capabilities(
             if enabled
             else "API key not configured or vendor disabled"
         )
-        result.append({
-            "vendor": info["vendor"],
-            "display_name": info["display_name"],
-            "enabled": enabled,
-            "available": available,
-            "unavailable_reason": reason,
-            "supported_stages": info["stages"],
-            "email_method": info["email_method"],
-            "supported_task_modes": [task_mode],
-        })
+        result.append(
+            {
+                "vendor": info["vendor"],
+                "display_name": info["display_name"],
+                "enabled": enabled,
+                "available": available,
+                "unavailable_reason": reason,
+                "supported_stages": info["stages"],
+                "email_method": info["email_method"],
+                "supported_task_modes": [task_mode],
+            }
+        )
     return result
 
 
@@ -528,7 +822,138 @@ def get_vendor_capabilities(
 def get_dashboard(
     user: User = require_permission("tasks:read"), db: Session = Depends(get_db)
 ) -> dict:
-    return services.dashboard(db)
+    from app.authz.context import authorization_context
+
+    return services.dashboard(db, authorization=authorization_context(db, user))
+
+
+@api_router.post("/data-assignments")
+def assign_data(
+    payload: DataAssignmentRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Move records between units after operation and scope checks."""
+    from app.authz.context import authorization_context
+    from app.authz.policy import authorize, authorize_batch
+    from app.modules.models import OrganizationUnit
+
+    ctx = authorization_context(db, user)
+    authorize(ctx, f"{payload.resource}:assign")
+    model = services.ASSIGNABLE_RESOURCE_MODELS[payload.resource]
+    entities = authorize_batch(db, model, payload.ids, ctx, resource=payload.resource)
+    target_unit = db.get(OrganizationUnit, payload.target_organization_unit_id)
+    if target_unit is None or target_unit.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="Organization unit not found")
+    target_owner = None
+    if payload.target_owner_id is not None:
+        target_owner = db.get(User, payload.target_owner_id)
+        if target_owner is None:
+            raise HTTPException(status_code=404, detail="Target owner not found")
+    try:
+        result = services.assign_business_data(
+            db,
+            resource=payload.resource,
+            entities=entities,
+            target_unit=target_unit,
+            target_owner=target_owner,
+            actor=user,
+            reason=payload.reason,
+        )
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.post("/data-shares")
+def share_data(
+    payload: DataShareRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Grant another unit read access; the original owner and unit remain unchanged."""
+    from app.authz.context import authorization_context
+    from app.authz.policy import authorize, authorize_batch
+    from app.modules.models import OrganizationUnit
+
+    ctx = authorization_context(db, user)
+    authorize(ctx, f"{payload.resource}:assign")
+    model = services.ASSIGNABLE_RESOURCE_MODELS[payload.resource]
+    entities = authorize_batch(db, model, payload.ids, ctx, resource=payload.resource)
+    target_unit = db.get(OrganizationUnit, payload.target_organization_unit_id)
+    if target_unit is None or target_unit.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="Organization unit not found")
+    try:
+        result = services.share_business_data(
+            db,
+            resource=payload.resource,
+            entities=entities,
+            target_unit=target_unit,
+            actor=user,
+            reason=payload.reason,
+        )
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api_router.get("/data-assignments/targets")
+def assignment_targets(
+    resource: Literal["tasks", "brands", "contacts", "emails"],
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.authz.context import authorization_context
+    from app.authz.policy import authorize
+    from app.modules.models import OrganizationUnit
+
+    authorize(authorization_context(db, user), f"{resource}:assign")
+    units = list(
+        db.scalars(
+            select(OrganizationUnit)
+            .where(
+                OrganizationUnit.organization_id == user.organization_id,
+                OrganizationUnit.status == "active",
+            )
+            .order_by(OrganizationUnit.depth, OrganizationUnit.sort_order)
+        )
+    )
+    users = list(
+        db.scalars(
+            select(User)
+            .where(
+                User.organization_id == user.organization_id,
+                User.status == "active",
+                User.deleted_at.is_(None),
+            )
+            .order_by(User.name)
+        )
+    )
+    return {
+        "units": [
+            {
+                "id": str(unit.id),
+                "name": unit.name,
+                "path": unit.path,
+                "depth": unit.depth,
+            }
+            for unit in units
+        ],
+        "users": [
+            {
+                "id": str(member.id),
+                "name": member.name,
+                "organization_unit_id": (
+                    str(member.organization_unit_id) if member.organization_unit_id else None
+                ),
+            }
+            for member in users
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +968,15 @@ def list_search_tasks(
     page_size: int = 50,
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_search_tasks(db, page, page_size, user.organization_id)
+    from app.authz.context import authorization_context
+
+    return services.list_search_tasks(
+        db,
+        page,
+        page_size,
+        user.organization_id,
+        authorization=authorization_context(db, user),
+    )
 
 
 @api_router.post(
@@ -551,7 +984,7 @@ def list_search_tasks(
 )
 def create_search_task(
     payload: SearchTaskCreate,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("tasks:create"),
     db: Session = Depends(get_db),
 ) -> SearchTask:
     if payload.mode != "excel_import" and not payload.selected_vendors:
@@ -560,7 +993,11 @@ def create_search_task(
             detail="Select Apollo, Hunter, or both before creating the task",
         )
     task = services.create_search_task(
-        db, payload, organization_id=user.organization_id, owner_id=user.id
+        db,
+        payload,
+        organization_id=user.organization_id,
+        owner_id=user.id,
+        organization_unit_id=user.organization_unit_id,
     )
     db.commit()
     db.refresh(task)
@@ -573,9 +1010,10 @@ def create_search_task(
     status_code=status.HTTP_202_ACCEPTED,
 )
 def start_search_task(
-    task_id: UUID, user: User = require_permission("tasks:execute"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:start"), db: Session = Depends(get_db)
 ) -> SearchTask:
     try:
+        require_task_access(db, task_id, user)
         current = db.get(SearchTask, task_id)
         should_enqueue = current is not None and current.status not in {
             TaskStatus.queued,
@@ -610,11 +1048,14 @@ def get_search_task(
 def list_task_discovery_candidates(
     task_id: UUID,
     candidate_status: str | None = Query(default=None, alias="status"),
-    evaluation_status: Literal["pending", "running", "insufficient_data", "completed", "failed"] | None = Query(default=None),
+    evaluation_status: Literal["pending", "running", "insufficient_data", "completed", "failed"]
+    | None = Query(default=None),
     rating: Literal["A", "B", "C", "D"] | None = Query(default=None),
     min_score: int | None = Query(default=None, ge=0, le=100),
     max_score: int | None = Query(default=None, ge=0, le=100),
-    sort_by: Literal["last_seen_at", "target_relevance_score"] = Query(default="target_relevance_score"),
+    sort_by: Literal["last_seen_at", "target_relevance_score"] = Query(
+        default="target_relevance_score"
+    ),
     sort_order: Literal["asc", "desc"] = Query(default="desc"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -624,11 +1065,7 @@ def list_task_discovery_candidates(
     """Task-scoped candidate list: DiscoveryCandidateHit is the match fact source."""
     from app.modules import discovery_review
 
-    task = db.get(SearchTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Search task not found")
-    if str(user.organization_id or "") != str(task.organization_id or ""):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    task = require_task_access(db, task_id, user)
     return discovery_review.list_task_candidates(
         db,
         task,
@@ -683,10 +1120,9 @@ def stream_task_events(
         with SessionLocal() as verify_db:
             task_row = verify_db.get(SearchTask, task_id_str)
             if task_row is None or (
-                task_row.organization_id is not None
-                and str(task_row.organization_id) != org_id
+                task_row.organization_id is not None and str(task_row.organization_id) != org_id
             ):
-                yield "event: error\ndata: {\"error\":\"not_found\"}\n\n"
+                yield 'event: error\ndata: {"error":"not_found"}\n\n'
                 return
 
         cursor = after_sequence
@@ -696,10 +1132,9 @@ def stream_task_events(
                 # Re-verify org access on each poll cycle
                 task_row = event_db.get(SearchTask, task_id_str)
                 if task_row is None or (
-                    task_row.organization_id is not None
-                    and str(task_row.organization_id) != org_id
+                    task_row.organization_id is not None and str(task_row.organization_id) != org_id
                 ):
-                    yield "event: error\ndata: {\"error\":\"not_found\"}\n\n"
+                    yield 'event: error\ndata: {"error":"not_found"}\n\n'
                     return
 
                 events = event_db.scalars(
@@ -742,8 +1177,9 @@ def stream_task_events(
 
 @api_router.post("/search-tasks/{task_id}/pause", response_model=SearchTaskRead)
 def pause_search_task(
-    task_id: UUID, user: User = require_permission("tasks:execute"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:pause"), db: Session = Depends(get_db)
 ) -> SearchTask:
+    require_task_access(db, task_id, user)
     try:
         task = services.pause_search_task(db, task_id)
         db.commit()
@@ -759,8 +1195,9 @@ def pause_search_task(
     status_code=status.HTTP_202_ACCEPTED,
 )
 def resume_search_task(
-    task_id: UUID, user: User = require_permission("tasks:execute"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:resume"), db: Session = Depends(get_db)
 ) -> SearchTask:
+    require_task_access(db, task_id, user)
     try:
         task = services.queue_search_task(db, task_id)
         db.commit()
@@ -773,8 +1210,9 @@ def resume_search_task(
 
 @api_router.post("/search-tasks/{task_id}/cancel", response_model=SearchTaskRead)
 def cancel_search_task(
-    task_id: UUID, user: User = require_permission("tasks:execute"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:cancel"), db: Session = Depends(get_db)
 ) -> SearchTask:
+    require_task_access(db, task_id, user)
     try:
         task = services.cancel_search_task(db, task_id)
         db.commit()
@@ -790,8 +1228,9 @@ def cancel_search_task(
     status_code=status.HTTP_201_CREATED,
 )
 def copy_search_task(
-    task_id: UUID, user: User = require_permission("tasks:write"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:create"), db: Session = Depends(get_db)
 ) -> SearchTask:
+    require_task_access(db, task_id, user)
     try:
         task = services.copy_search_task(db, task_id)
         db.commit()
@@ -810,7 +1249,8 @@ def copy_search_task(
 def list_discovery_candidates(
     candidate_status: str | None = Query(default=None, alias="status"),
     task_id: UUID | None = Query(default=None),
-    evaluation_status: Literal["pending", "running", "insufficient_data", "completed", "failed"] | None = Query(default=None),
+    evaluation_status: Literal["pending", "running", "insufficient_data", "completed", "failed"]
+    | None = Query(default=None),
     rating: Literal["A", "B", "C", "D"] | None = Query(default=None),
     min_score: int | None = Query(default=None, ge=0, le=100),
     max_score: int | None = Query(default=None, ge=0, le=100),
@@ -845,18 +1285,12 @@ def list_discovery_candidates(
 def approve_discovery_candidate(
     candidate_id: UUID,
     payload: DiscoveryCandidateApprove,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:review"),
     db: Session = Depends(get_db),
 ) -> dict:
-    source_task = db.get(SearchTask, payload.task_id)
-    if source_task is None or str(user.organization_id or "") != str(
-        source_task.organization_id or ""
-    ):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    source_task = require_task_access(db, payload.task_id, user)
     candidate = db.scalar(
-        select(DiscoveryCandidate)
-        .where(DiscoveryCandidate.id == candidate_id)
-        .with_for_update()
+        select(DiscoveryCandidate).where(DiscoveryCandidate.id == candidate_id).with_for_update()
     )
     hit = db.scalar(
         select(DiscoveryCandidateHit)
@@ -901,7 +1335,7 @@ def approve_discovery_candidate(
 def reject_discovery_candidate(
     candidate_id: UUID,
     payload: DiscoveryCandidateReject,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:review"),
     db: Session = Depends(get_db),
 ) -> dict:
     candidate = db.get(DiscoveryCandidate, candidate_id)
@@ -921,7 +1355,7 @@ def reject_discovery_candidate(
 )
 def enrich_discovery_candidate_industry(
     candidate_id: UUID,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     candidate = db.get(DiscoveryCandidate, candidate_id)
@@ -939,7 +1373,7 @@ def enrich_discovery_candidate_industry(
 @api_router.post("/discovery-candidates/bulk-enrich-industry", status_code=status.HTTP_202_ACCEPTED)
 def bulk_enrich_discovery_candidate_industry(
     payload: DiscoveryCandidateBatchRequest,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     candidates = list(
@@ -962,8 +1396,8 @@ def bulk_enrich_discovery_candidate_industry(
 @api_router.post("/discovery-candidates/bulk-approve")
 def bulk_approve_discovery_candidates(
     payload: DiscoveryCandidateBulkApprove,
-    user: User = require_permission("brands:write"),
-    _executor: User = require_permission("tasks:execute"),
+    user: User = require_permission("brands:review"),
+    _executor: User = require_permission("tasks:start"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Batch-start user-selected precise enrichment candidates.
@@ -977,11 +1411,7 @@ def bulk_approve_discovery_candidates(
     """
     from app.modules import discovery_review
 
-    source_task = db.get(SearchTask, payload.task_id)
-    if source_task is None or str(user.organization_id or "") != str(
-        source_task.organization_id or ""
-    ):
-        raise HTTPException(status_code=404, detail="Search task not found")
+    source_task = require_task_access(db, payload.task_id, user)
 
     items: list[dict] = []
     approved = skipped = failed = 0
@@ -1003,12 +1433,14 @@ def bulk_approve_discovery_candidates(
         if blocker is not None:
             code, message = blocker
             skipped += 1
-            items.append({
-                "candidate_id": str(candidate_id),
-                "status": "skipped",
-                "reason_code": code,
-                "message": message,
-            })
+            items.append(
+                {
+                    "candidate_id": str(candidate_id),
+                    "status": "skipped",
+                    "reason_code": code,
+                    "message": message,
+                }
+            )
             db.rollback()
             continue
         try:
@@ -1024,22 +1456,26 @@ def bulk_approve_discovery_candidates(
         except ValueError as exc:
             db.rollback()
             skipped += 1
-            items.append({
-                "candidate_id": str(candidate_id),
-                "status": "skipped",
-                "reason_code": "INVALID_STATUS",
-                "message": str(exc)[:200],
-            })
+            items.append(
+                {
+                    "candidate_id": str(candidate_id),
+                    "status": "skipped",
+                    "reason_code": "INVALID_STATUS",
+                    "message": str(exc)[:200],
+                }
+            )
             continue
         except Exception:
             db.rollback()
             failed += 1
-            items.append({
-                "candidate_id": str(candidate_id),
-                "status": "failed",
-                "reason_code": "TASK_CREATE_FAILED",
-                "message": "创建精准丰富任务失败，请重试",
-            })
+            items.append(
+                {
+                    "candidate_id": str(candidate_id),
+                    "status": "failed",
+                    "reason_code": "TASK_CREATE_FAILED",
+                    "message": "创建精准丰富任务失败，请重试",
+                }
+            )
             continue
         try:
             execute_search_task_job.delay(str(task.id))
@@ -1048,11 +1484,13 @@ def bulk_approve_discovery_candidates(
             # re-enqueues it. Enqueue failure must not fail the record.
             pass
         approved += 1
-        items.append({
-            "candidate_id": str(candidate_id),
-            "status": "approved",
-            "task_id": str(task.id),
-        })
+        items.append(
+            {
+                "candidate_id": str(candidate_id),
+                "status": "approved",
+                "task_id": str(task.id),
+            }
+        )
     return {"approved": approved, "skipped": skipped, "failed": failed, "items": items}
 
 
@@ -1068,7 +1506,9 @@ def list_brands(
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_brands(db, page, page_size)
+    from app.authz.context import authorization_context
+
+    return services.list_brands(db, page, page_size, authorization=authorization_context(db, user))
 
 
 @api_router.get("/brands/hierarchy")
@@ -1078,16 +1518,26 @@ def list_brand_hierarchy(
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> dict:
-    return services.list_brand_hierarchy(db, page, page_size)
+    from app.authz.context import authorization_context
+
+    return services.list_brand_hierarchy(
+        db, page, page_size, authorization=authorization_context(db, user)
+    )
 
 
 @api_router.post("/brands", status_code=status.HTTP_201_CREATED)
 def create_brand(
     payload: BrandCreate,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:create"),
     db: Session = Depends(get_db),
 ) -> dict:
-    brand = services.create_brand(db, payload)
+    brand = services.create_brand(
+        db,
+        payload,
+        organization_id=user.organization_id,
+        organization_unit_id=user.organization_unit_id,
+        owner_id=user.id,
+    )
     db.commit()
     db.refresh(brand)
     return services.to_dict(brand)
@@ -1097,8 +1547,8 @@ def create_brand(
 def get_brand(
     brand_id: UUID, user: User = require_permission("brands:read"), db: Session = Depends(get_db)
 ) -> dict:
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     return services.brand_detail(db, brand)
 
@@ -1107,11 +1557,11 @@ def get_brand(
 def update_brand(
     brand_id: UUID,
     payload: BrandUpdate,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     services.update_brand(db, brand, payload)
     db.commit()
@@ -1121,10 +1571,10 @@ def update_brand(
 
 @api_router.delete("/brands/{brand_id}", status_code=status.HTTP_204_NO_CONTENT)
 def archive_brand(
-    brand_id: UUID, user: User = require_permission("brands:write"), db: Session = Depends(get_db)
+    brand_id: UUID, user: User = require_permission("brands:archive"), db: Session = Depends(get_db)
 ) -> None:
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     services.bulk_archive_brands(db, [brand_id])
     db.commit()
@@ -1133,9 +1583,10 @@ def archive_brand(
 @api_router.post("/brands/bulk-archive")
 def bulk_archive_brands(
     payload: BrandBatchRequest,
-    user: User = require_permission("brands:write"),
+    user: User = require_permission("brands:archive"),
     db: Session = Depends(get_db),
 ) -> dict:
+    _authorize_scoped_batch(db, Brand, payload.ids, user, "brands")
     result = services.bulk_archive_brands(db, payload.ids)
     db.commit()
     return result
@@ -1143,10 +1594,10 @@ def bulk_archive_brands(
 
 @api_router.post("/brands/{brand_id}/enrich", status_code=status.HTTP_202_ACCEPTED)
 def enrich_brand(
-    brand_id: UUID, user: User = require_permission("brands:write"), db: Session = Depends(get_db)
+    brand_id: UUID, user: User = require_permission("brands:update"), db: Session = Depends(get_db)
 ) -> dict:
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     provider = services.enabled_provider(db, "company_search")
     if provider is None:
@@ -1163,10 +1614,10 @@ def enrich_brand(
 
 @api_router.post("/brands/{brand_id}/approve-discovery", status_code=status.HTTP_202_ACCEPTED)
 def approve_brand_discovery(
-    brand_id: UUID, user: User = require_permission("brands:write"), db: Session = Depends(get_db)
+    brand_id: UUID, user: User = require_permission("brands:promote"), db: Session = Depends(get_db)
 ) -> dict:
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     try:
         task = services.approve_discovery_brand(db, brand)
@@ -1183,11 +1634,11 @@ def approve_brand_discovery(
 
 @api_router.post("/brands/{brand_id}/parse-website", status_code=status.HTTP_202_ACCEPTED)
 def parse_brand_website(
-    brand_id: UUID, user: User = require_permission("brands:write"), db: Session = Depends(get_db)
+    brand_id: UUID, user: User = require_permission("brands:update"), db: Session = Depends(get_db)
 ) -> dict:
     """Manually trigger website parsing for a single brand."""
-    brand = db.get(Brand, brand_id)
-    if brand is None or brand.deleted_at is not None:
+    brand = _load_scoped(db, Brand, brand_id, user, "brands")
+    if brand.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Brand not found")
     if not brand.primary_website:
         raise HTTPException(status_code=400, detail="Brand has no website URL")
@@ -1210,18 +1661,31 @@ def list_contacts(
     search: str | None = Query(default=None, max_length=200),
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.authz.context import authorization_context
+
     return services.list_contacts(
-        db, page, page_size, search=search, organization_id=user.organization_id
+        db,
+        page,
+        page_size,
+        search=search,
+        organization_id=user.organization_id,
+        authorization=authorization_context(db, user),
     )
 
 
 @api_router.post("/contacts", status_code=status.HTTP_201_CREATED)
 def create_contact(
     payload: ContactCreate,
-    user: User = require_permission("contacts:write"),
+    user: User = require_permission("contacts:create"),
     db: Session = Depends(get_db),
 ) -> dict:
-    contact = services.create_contact(db, payload, organization_id=user.organization_id)
+    contact = services.create_contact(
+        db,
+        payload,
+        organization_id=user.organization_id,
+        organization_unit_id=user.organization_unit_id,
+        owner_id=user.id,
+    )
     db.commit()
     db.refresh(contact)
     return services.to_dict(contact)
@@ -1231,11 +1695,11 @@ def create_contact(
 def update_contact(
     contact_id: UUID,
     payload: ContactUpdate,
-    user: User = require_permission("contacts:write"),
+    user: User = require_permission("contacts:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    contact = db.get(Contact, contact_id)
-    if contact is None or contact.deleted_at is not None:
+    contact = _load_scoped(db, Contact, contact_id, user, "contacts")
+    if contact.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Contact not found")
     services.update_contact(db, contact, payload)
     db.commit()
@@ -1246,11 +1710,11 @@ def update_contact(
 @api_router.delete("/contacts/{contact_id}", status_code=status.HTTP_204_NO_CONTENT)
 def archive_contact(
     contact_id: UUID,
-    user: User = require_permission("contacts:write"),
+    user: User = require_permission("contacts:delete"),
     db: Session = Depends(get_db),
 ) -> None:
-    contact = db.get(Contact, contact_id)
-    if contact is None or contact.deleted_at is not None:
+    contact = _load_scoped(db, Contact, contact_id, user, "contacts")
+    if contact.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Contact not found")
     services.bulk_archive_contacts(db, [contact_id])
     db.commit()
@@ -1259,9 +1723,10 @@ def archive_contact(
 @api_router.post("/contacts/bulk-archive")
 def bulk_archive_contacts(
     payload: ContactBatchRequest,
-    user: User = require_permission("contacts:write"),
+    user: User = require_permission("contacts:bulk_delete"),
     db: Session = Depends(get_db),
 ) -> dict:
+    _authorize_scoped_batch(db, Contact, payload.ids, user, "contacts")
     result = services.bulk_archive_contacts(db, payload.ids)
     db.commit()
     return result
@@ -1270,9 +1735,10 @@ def bulk_archive_contacts(
 @api_router.post("/contacts/export")
 def export_selected_contacts(
     payload: ContactBatchRequest,
-    user: User = require_permission("export:execute"),
+    user: User = require_permission("contacts:export"),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
+    _authorize_scoped_batch(db, Contact, payload.ids, user, "contacts")
     content, count = services.export_selected_contacts_csv(db, payload.ids)
     db.commit()
     return StreamingResponse(
@@ -1302,6 +1768,8 @@ def list_emails(
     min_confidence: int | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
+    from app.authz.context import authorization_context
+
     return services.list_emails(
         db,
         page,
@@ -1311,6 +1779,7 @@ def list_emails(
         pool=pool,
         min_confidence=min_confidence,
         brand_id=brand_id,
+        authorization=authorization_context(db, user),
     )
 
 
@@ -1320,6 +1789,7 @@ def get_email_authenticity(
     user: User = require_permission("emails:read"),
     db: Session = Depends(get_db),
 ) -> dict:
+    _load_scoped(db, EmailAddress, email_id, user, "emails")
     try:
         return services.email_authenticity_detail(db, email_id)
     except ValueError as exc:
@@ -1329,10 +1799,16 @@ def get_email_authenticity(
 @api_router.post("/emails", status_code=status.HTTP_201_CREATED)
 def create_email(
     payload: EmailCreate,
-    user: User = require_permission("emails:write"),
+    user: User = require_permission("emails:create"),
     db: Session = Depends(get_db),
 ) -> dict:
-    email = services.create_email(db, payload)
+    email = services.create_email(
+        db,
+        payload,
+        organization_id=user.organization_id,
+        organization_unit_id=user.organization_unit_id,
+        owner_id=user.id,
+    )
     db.commit()
     db.refresh(email)
     return services.to_dict(email)
@@ -1342,11 +1818,11 @@ def create_email(
 def update_email(
     email_id: UUID,
     payload: EmailUpdate,
-    user: User = require_permission("emails:write"),
+    user: User = require_permission("emails:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    email = db.get(EmailAddress, email_id)
-    if email is None or email.deleted_at is not None:
+    email = _load_scoped(db, EmailAddress, email_id, user, "emails")
+    if email.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Email not found")
     services.update_email(db, email, payload)
     db.commit()
@@ -1356,10 +1832,10 @@ def update_email(
 
 @api_router.delete("/emails/{email_id}", status_code=status.HTTP_204_NO_CONTENT)
 def archive_email(
-    email_id: UUID, user: User = require_permission("emails:write"), db: Session = Depends(get_db)
+    email_id: UUID, user: User = require_permission("emails:delete"), db: Session = Depends(get_db)
 ) -> None:
-    email = db.get(EmailAddress, email_id)
-    if email is None or email.deleted_at is not None:
+    email = _load_scoped(db, EmailAddress, email_id, user, "emails")
+    if email.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Email not found")
     services.archive_entity(db, email, "email")
     db.commit()
@@ -1368,9 +1844,10 @@ def archive_email(
 @api_router.post("/emails/bulk-archive")
 def bulk_archive_emails(
     payload: EmailBatchRequest,
-    user: User = require_permission("emails:write"),
+    user: User = require_permission("emails:delete"),
     db: Session = Depends(get_db),
 ) -> dict:
+    _authorize_scoped_batch(db, EmailAddress, payload.ids, user, "emails")
     result = services.bulk_archive_emails(db, payload.ids)
     db.commit()
     return result
@@ -1379,9 +1856,10 @@ def bulk_archive_emails(
 @api_router.post("/emails/export")
 def export_selected_emails(
     payload: EmailBatchRequest,
-    user: User = require_permission("export:execute"),
+    user: User = require_permission("emails:export"),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
+    _authorize_scoped_batch(db, EmailAddress, payload.ids, user, "emails")
     content, count = services.export_selected_emails_csv(db, payload.ids)
     db.commit()
     return StreamingResponse(
@@ -1397,16 +1875,22 @@ def export_selected_emails(
 @api_router.post("/emails/verify", status_code=status.HTTP_202_ACCEPTED)
 def verify_email(
     payload: EmailVerifyRequest,
-    user: User = require_permission("emails:verify"),
+    user: User = require_permission("emails:bulk_verify"),
     db: Session = Depends(get_db),
 ) -> dict:
     if payload.email_id is None:
         if payload.address is None:
             raise HTTPException(status_code=400, detail="email_id or address is required")
-        email = services.create_email(db, EmailCreate(address=payload.address))
+        email = services.create_email(
+            db,
+            EmailCreate(address=payload.address),
+            organization_id=user.organization_id,
+            organization_unit_id=user.organization_unit_id,
+            owner_id=user.id,
+        )
     else:
-        email = db.get(EmailAddress, payload.email_id)
-        if email is None or email.deleted_at is not None:
+        email = _load_scoped(db, EmailAddress, payload.email_id, user, "emails")
+        if email.deleted_at is not None:
             raise HTTPException(status_code=404, detail="Email not found")
     try:
         verified = services.verify_email(db, email.id)
@@ -1421,7 +1905,7 @@ def verify_email(
 def review_email(
     email_id: UUID,
     payload: EmailReviewRequest,
-    user: User = require_permission("emails:write"),
+    user: User = require_permission("emails:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1440,7 +1924,7 @@ def review_email(
 
 @api_router.post("/search-tasks/{task_id}/retry-failed", status_code=status.HTTP_202_ACCEPTED)
 def retry_failed_task_items(
-    task_id: UUID, user: User = require_permission("tasks:execute"), db: Session = Depends(get_db)
+    task_id: UUID, user: User = require_permission("tasks:retry"), db: Session = Depends(get_db)
 ) -> dict:
     try:
         retried = services.retry_failed_task_items(db, task_id)
@@ -1458,17 +1942,20 @@ def retry_failed_task_items(
 
 @api_router.post("/dedup/check")
 def dedup_check(
-    user: User = require_permission("dedup:execute"), db: Session = Depends(get_db)
+    user: User = require_permission("dedup:read"), db: Session = Depends(get_db)
 ) -> dict:
-    return services.dedup_check(db)
+    return services.dedup_check(db, user.organization_id)
 
 
 @api_router.post("/dedup/merge")
 def dedup_merge(
     payload: DedupMergeRequest,
-    user: User = require_permission("dedup:execute"),
+    user: User = require_permission("dedup:merge"),
     db: Session = Depends(get_db),
 ) -> dict:
+    model = {"brand": Brand, "contact": Contact, "email": EmailAddress}[payload.entity_type]
+    resource = {"brand": "brands", "contact": "contacts", "email": "emails"}[payload.entity_type]
+    _authorize_scoped_batch(db, model, [payload.primary_id, *payload.duplicate_ids], user, resource)
     try:
         result = services.merge_duplicates(db, payload)
         db.commit()
@@ -1487,7 +1974,7 @@ async def import_file(
     entity_type: str = Form(...),
     file: UploadFile = File(...),
     field_mapping: str | None = Form(None),
-    user: User = require_permission("import:execute"),
+    user: User = require_permission("imports:execute"),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1495,7 +1982,15 @@ async def import_file(
         mapping = json.loads(field_mapping) if field_mapping else None
         if mapping is not None and not isinstance(mapping, dict):
             raise ValueError("field_mapping must be a JSON object")
-        result = services.import_rows(db, entity_type, rows, mapping)
+        from app.authz.context import authorization_context
+
+        result = services.import_rows(
+            db,
+            entity_type,
+            rows,
+            mapping,
+            authorization=authorization_context(db, user),
+        )
         db.commit()
         return result
     except ValueError as exc:
@@ -1505,7 +2000,7 @@ async def import_file(
 @api_router.post("/imports/preview")
 async def preview_import_file(
     file: UploadFile = File(...),
-    user: User = require_permission("import:execute"),
+    user: User = require_permission("imports:preview"),
 ) -> dict:
     try:
         rows = read_rows(file.filename or "upload.csv", await file.read())
@@ -1523,7 +2018,7 @@ async def preview_import_file(
 
 @api_router.get("/batch-exact-brand/capabilities")
 async def batch_exact_brand_capabilities(
-    user: User = require_permission("tasks:read"),
+    user: User = require_permission("imports:read"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Expose the rollout state so clients can hide disabled entry points."""
@@ -1534,7 +2029,7 @@ async def batch_exact_brand_capabilities(
 
 @api_router.get("/batch-exact-brand/template")
 async def download_batch_template(
-    user: User = require_permission("tasks:read"),
+    user: User = require_permission("imports:read"),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """Download the versioned CSV template for batch exact brand import."""
@@ -1556,7 +2051,7 @@ async def download_batch_template(
 @api_router.post("/batch-exact-brand/preview")
 async def preview_batch_import(
     file: UploadFile = File(...),
-    user: User = require_permission("import:execute"),
+    user: User = require_permission("imports:preview"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Parse and validate an uploaded file, returning a read-only preview.
@@ -1598,7 +2093,7 @@ async def preview_batch_import(
 @api_router.post("/batch-exact-brand/imports", status_code=status.HTTP_201_CREATED)
 async def create_batch_import(
     file: UploadFile = File(...),
-    user: User = require_permission("import:execute"),
+    user: User = require_permission("imports:execute"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Upload a file, parse it, and persist a BatchImport record."""
@@ -1627,6 +2122,7 @@ async def create_batch_import(
             file_hash=preview["file_hash"],
             parsed_rows=preview["rows"],
             organization_id=user.organization_id,
+            organization_unit_id=user.organization_unit_id,
             created_by=user.id,
         )
         services.audit(
@@ -1661,18 +2157,13 @@ async def create_batch_import(
 @api_router.get("/batch-exact-brand/imports/{batch_id}")
 async def get_batch_import_detail(
     batch_id: UUID,
-    user: User = require_permission("tasks:read"),
+    user: User = require_permission("imports:read"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Get batch import detail with aggregated target statistics."""
     from app.modules.batch_exact_brand import get_batch_detail
 
-    batch = db.get(BatchImport, batch_id)
-    if batch is None:
-        raise HTTPException(status_code=404, detail="导入批次不存在")
-    # Org isolation
-    if batch.organization_id is not None and str(batch.organization_id) != str(user.organization_id):
-        raise HTTPException(status_code=404, detail="导入批次不存在")
+    _load_scoped(db, BatchImport, batch_id, user, "imports")
 
     try:
         return get_batch_detail(db, batch_id)
@@ -1684,7 +2175,7 @@ async def get_batch_import_detail(
 async def confirm_batch_import(
     batch_id: UUID,
     payload: BatchImportConfirm,
-    user: User = require_permission("tasks:write"),
+    user: User = require_permission("imports:execute"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Confirm a batch import — creates parent SearchTask, Targets, TaskVendorPlan.
@@ -1693,11 +2184,7 @@ async def confirm_batch_import(
     """
     from app.modules.batch_exact_brand import confirm_batch_import
 
-    batch = db.get(BatchImport, batch_id)
-    if batch is None:
-        raise HTTPException(status_code=404, detail="导入批次不存在")
-    if batch.organization_id is not None and str(batch.organization_id) != str(user.organization_id):
-        raise HTTPException(status_code=404, detail="导入批次不存在")
+    _load_scoped(db, BatchImport, batch_id, user, "imports")
 
     try:
         result = confirm_batch_import(
@@ -1748,7 +2235,7 @@ async def list_task_targets(
 async def retry_failed_targets(
     task_id: UUID,
     payload: TargetRetryRequest,
-    user: User = require_permission("tasks:execute"),
+    user: User = require_permission("tasks:retry"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Retry specific failed/retryable targets."""
@@ -1770,7 +2257,7 @@ async def retry_failed_targets(
 @api_router.get("/search-tasks/{task_id}/targets/errors.csv")
 async def export_target_errors_csv(
     task_id: UUID,
-    user: User = require_permission("export:execute"),
+    user: User = require_permission("tasks:export"),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """Export error rows as downloadable CSV."""
@@ -1792,7 +2279,7 @@ async def export_target_errors_csv(
 @api_router.get("/search-tasks/{task_id}/targets/export.csv")
 async def export_reliable_emails_csv(
     task_id: UUID,
-    user: User = require_permission("export:execute"),
+    user: User = require_permission("tasks:export"),
     db: Session = Depends(get_db),
     scope: str = Query("verified", pattern="^(verified|reviewable|all)$"),
 ) -> StreamingResponse:
@@ -1821,10 +2308,18 @@ async def export_reliable_emails_csv(
 @api_router.post("/exports")
 def export_file(
     payload: ExportRequest,
-    user: User = require_permission("export:execute"),
+    user: User = require_permission("exports:execute"),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
-    content = services.export_csv(db, payload.entity_type, payload.filters)
+    from app.authz.context import authorization_context
+    from app.authz.policy import authorize
+
+    ctx = authorization_context(db, user)
+    permission = (
+        "audit:export" if payload.entity_type == "audit_logs" else f"{payload.entity_type}:export"
+    )
+    authorize(ctx, permission)
+    content = services.export_csv(db, payload.entity_type, payload.filters, authorization=ctx)
     db.commit()
     filename = f"buyerreach-{payload.entity_type}.csv"
     return StreamingResponse(
@@ -1850,7 +2345,7 @@ def list_vendor_credentials(
 def update_vendor_credential(
     vendor: str,
     payload: VendorCredentialUpdate,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     credential = (
@@ -1867,7 +2362,7 @@ def update_vendor_credential(
 @api_router.post("/vendor-credentials/{vendor}/test")
 def test_vendor_credential(
     vendor: str,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:test"),
     db: Session = Depends(get_db),
 ) -> dict:
     credential = (
@@ -1893,7 +2388,7 @@ def list_provider_configs(
 @api_router.post("/provider-configs", status_code=status.HTTP_201_CREATED)
 def create_provider_config(
     payload: ProviderConfigCreate,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     provider = services.create_provider_config(db, payload)
@@ -1906,7 +2401,7 @@ def create_provider_config(
 def update_provider_config(
     provider_id: UUID,
     payload: ProviderConfigUpdate,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     provider = db.get(ProviderConfig, provider_id)
@@ -1921,7 +2416,7 @@ def update_provider_config(
 @api_router.post("/provider-configs/{provider_id}/test")
 def test_provider_config(
     provider_id: UUID,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:test"),
     db: Session = Depends(get_db),
 ) -> dict:
     provider = db.get(ProviderConfig, provider_id)
@@ -1935,7 +2430,7 @@ def test_provider_config(
 @api_router.delete("/provider-configs/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_provider_config(
     provider_id: UUID,
-    user: User = require_permission("providers:write"),
+    user: User = require_permission("providers:delete"),
     db: Session = Depends(get_db),
 ) -> None:
     provider = db.get(ProviderConfig, provider_id)
@@ -1958,15 +2453,416 @@ def get_system_settings(
     return services.get_system_settings(db)
 
 
+@api_router.get("/task-defaults")
+def get_task_defaults(
+    user: User = require_permission("tasks:read"), db: Session = Depends(get_db)
+) -> dict:
+    return services.get_task_defaults(db)
+
+
 @api_router.patch("/system-settings")
 def update_system_settings(
     payload: SystemSettingsUpdate,
-    user: User = require_permission("settings:write"),
+    user: User = require_permission("settings:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     result = services.update_system_settings(db, payload)
     db.commit()
     return result
+
+
+# ── Organization Units ───────────────────────────────────────────────────────
+
+
+@api_router.get("/organization-units/tree")
+def get_organization_unit_tree(
+    user: User = require_permission("organization_units:read"),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Return the full organization unit tree for the current user's organization."""
+    from app.modules.models import OrganizationUnit
+    from sqlalchemy import select as sa_select
+
+    units = list(
+        db.scalars(
+            sa_select(OrganizationUnit)
+            .where(
+                OrganizationUnit.organization_id == user.organization_id
+                if user.organization_id
+                else True
+            )
+            .order_by(OrganizationUnit.depth, OrganizationUnit.sort_order)
+        ).all()
+    )
+
+    # Build tree
+    node_map: dict[str, dict] = {}
+    roots: list[dict] = []
+    for unit in units:
+        node = {
+            "id": str(unit.id),
+            "organization_id": str(unit.organization_id),
+            "parent_id": str(unit.parent_id) if unit.parent_id else None,
+            "name": unit.name,
+            "code": unit.code,
+            "unit_type": unit.unit_type,
+            "manager_user_id": str(unit.manager_user_id) if unit.manager_user_id else None,
+            "path": unit.path,
+            "depth": unit.depth,
+            "sort_order": unit.sort_order,
+            "status": unit.status,
+            "version": unit.version,
+            "children": [],
+        }
+        node_map[str(unit.id)] = node
+        if unit.parent_id is None:
+            roots.append(node)
+
+    for unit in units:
+        if unit.parent_id and str(unit.parent_id) in node_map:
+            node_map[str(unit.parent_id)]["children"].append(node_map[str(unit.id)])
+
+    return roots
+
+
+@api_router.post("/organization-units", status_code=status.HTTP_201_CREATED)
+def create_organization_unit(
+    payload: dict,
+    user: User = require_permission("organization_units:create"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Create a new organization unit."""
+    from app.modules.models import OrganizationUnit
+
+    name = (payload.get("name") or "").strip()
+    code = (payload.get("code") or "").strip()
+    if not name or not code:
+        raise HTTPException(status_code=400, detail="名称和代码为必填项")
+
+    parent_id = payload.get("parent_id")
+    unit_type = payload.get("unit_type", "department")
+    manager_user_id = payload.get("manager_user_id")
+
+    if parent_id:
+        parent = db.get(OrganizationUnit, UUID(str(parent_id)))
+        if parent is None:
+            raise HTTPException(status_code=404, detail="父节点不存在")
+        if str(parent.organization_id) != str(user.organization_id):
+            raise HTTPException(status_code=404, detail="父节点不存在")
+
+        parent_path = parent.path or "/"
+        depth = parent.depth + 1
+    else:
+        parent_path = "/"
+        depth = 0
+
+    # Check uniqueness within org
+    existing = db.scalar(
+        select(OrganizationUnit).where(
+            OrganizationUnit.organization_id == user.organization_id,
+            OrganizationUnit.code == code,
+        )
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"代码 '{code}' 已存在")
+
+    unit_id = uuid4()
+    unit = OrganizationUnit(
+        id=unit_id,
+        organization_id=user.organization_id,
+        parent_id=UUID(str(parent_id)) if parent_id else None,
+        name=name,
+        code=code,
+        unit_type=unit_type or "department",
+        manager_user_id=UUID(str(manager_user_id)) if manager_user_id else None,
+        path=f"{parent_path}{parent.id}/" if parent_id else "/",
+        depth=depth,
+    )
+    db.add(unit)
+
+    # Audit
+    audit = AuditLog(
+        actor_id=str(user.id),
+        action="organization_unit.create",
+        entity_type="organization_unit",
+        entity_id=str(unit.id),
+        after={"name": name, "code": code, "parent_id": parent_id},
+        organization_id=user.organization_id,
+    )
+    db.add(audit)
+
+    db.commit()
+    return {
+        "id": str(unit.id),
+        "name": unit.name,
+        "code": unit.code,
+        "unit_type": unit.unit_type,
+        "parent_id": str(unit.parent_id) if unit.parent_id else None,
+        "path": unit.path,
+        "depth": unit.depth,
+        "status": unit.status,
+    }
+
+
+@api_router.patch("/organization-units/{unit_id}")
+def update_organization_unit(
+    unit_id: UUID,
+    payload: dict,
+    user: User = require_permission("organization_units:update"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Update organization unit name, code, type, or manager."""
+    from app.modules.models import OrganizationUnit
+
+    unit = db.get(OrganizationUnit, unit_id)
+    if unit is None:
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+    if str(unit.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+
+    before = {"name": unit.name, "code": unit.code, "unit_type": unit.unit_type}
+    changed = False
+
+    if "name" in payload:
+        unit.name = payload["name"].strip()
+        changed = True
+    if "code" in payload:
+        new_code = payload["code"].strip()
+        existing = db.scalar(
+            select(OrganizationUnit).where(
+                OrganizationUnit.organization_id == user.organization_id,
+                OrganizationUnit.code == new_code,
+                OrganizationUnit.id != unit.id,
+            )
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail=f"代码 '{new_code}' 已被使用")
+        unit.code = new_code
+        changed = True
+    if "unit_type" in payload:
+        unit.unit_type = payload["unit_type"]
+        changed = True
+    if "manager_user_id" in payload:
+        unit.manager_user_id = (
+            UUID(str(payload["manager_user_id"])) if payload["manager_user_id"] else None
+        )
+        changed = True
+
+    unit.version = (unit.version or 0) + 1
+
+    if changed:
+        audit = AuditLog(
+            actor_id=str(user.id),
+            action="organization_unit.update",
+            entity_type="organization_unit",
+            entity_id=str(unit.id),
+            before=before,
+            after={"name": unit.name, "code": unit.code, "unit_type": unit.unit_type},
+            organization_id=user.organization_id,
+        )
+        db.add(audit)
+
+    db.commit()
+    return {"id": str(unit.id), "name": unit.name, "code": unit.code, "version": unit.version}
+
+
+@api_router.post("/organization-units/{unit_id}/move")
+def move_organization_unit(
+    unit_id: UUID,
+    payload: dict,
+    user: User = require_permission("organization_units:move"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Move an organization unit to a new parent."""
+    from app.modules.models import OrganizationUnit
+    from app.authz.hierarchy import validate_move, count_active_users_in_unit
+
+    unit = db.get(OrganizationUnit, unit_id)
+    if unit is None:
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+    if str(unit.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+
+    new_parent_id = payload.get("parent_id")
+    valid, error = validate_move(db, str(unit_id), new_parent_id)
+    if not valid:
+        raise HTTPException(status_code=400, detail=error)
+
+    affected_users = count_active_users_in_unit(db, str(unit_id))
+
+    before = {"parent_id": str(unit.parent_id) if unit.parent_id else None}
+    new_parent = db.get(OrganizationUnit, new_parent_id)
+    old_prefix = f"{unit.path}{unit.id}/"
+    new_path = f"{new_parent.path}{new_parent.id}/"
+    depth_delta = (new_parent.depth + 1) - unit.depth
+    descendants = list(
+        db.scalars(
+            select(OrganizationUnit).where(
+                OrganizationUnit.organization_id == unit.organization_id,
+                OrganizationUnit.path.startswith(old_prefix),
+            )
+        ).all()
+    )
+    unit.parent_id = new_parent.id
+    unit.path = new_path
+    unit.depth = new_parent.depth + 1
+    for descendant in descendants:
+        descendant.path = f"{new_path}{unit.id}/{descendant.path.removeprefix(old_prefix)}"
+        descendant.depth += depth_delta
+        descendant.version = (descendant.version or 0) + 1
+    unit.version = (unit.version or 0) + 1
+
+    audit = AuditLog(
+        actor_id=str(user.id),
+        action="organization_unit.move",
+        entity_type="organization_unit",
+        entity_id=str(unit.id),
+        before=before,
+        after={
+            "parent_id": str(unit.parent_id) if unit.parent_id else None,
+            "affected_users": affected_users,
+        },
+        organization_id=user.organization_id,
+    )
+    db.add(audit)
+
+    db.commit()
+    return {
+        "id": str(unit.id),
+        "parent_id": str(unit.parent_id) if unit.parent_id else None,
+        "affected_users": affected_users,
+    }
+
+
+@api_router.post("/organization-units/{unit_id}/disable")
+def disable_organization_unit(
+    unit_id: UUID,
+    user: User = require_permission("organization_units:disable"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Disable an organization unit (prevents new user/data creation, history preserved)."""
+    from app.modules.models import OrganizationUnit
+
+    unit = db.get(OrganizationUnit, unit_id)
+    if unit is None:
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+    if str(unit.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+
+    unit.status = "disabled"
+
+    audit = AuditLog(
+        actor_id=str(user.id),
+        action="organization_unit.disable",
+        entity_type="organization_unit",
+        entity_id=str(unit.id),
+        before={"status": "active"},
+        after={"status": "disabled"},
+        organization_id=user.organization_id,
+    )
+    db.add(audit)
+    db.commit()
+    return {"id": str(unit.id), "status": unit.status}
+
+
+@api_router.post("/organization-units/{unit_id}/enable")
+def enable_organization_unit(
+    unit_id: UUID,
+    user: User = require_permission("organization_units:enable"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Re-enable an organization unit after validating its tenant boundary."""
+    from app.modules.models import OrganizationUnit
+
+    unit = db.get(OrganizationUnit, unit_id)
+    if unit is None or unit.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+    unit.status = "active"
+    unit.version = (unit.version or 0) + 1
+    db.add(
+        AuditLog(
+            actor_id=str(user.id),
+            action="organization_unit.enable",
+            entity_type="organization_unit",
+            entity_id=str(unit.id),
+            before={"status": "disabled"},
+            after={"status": "active"},
+            organization_id=user.organization_id,
+        )
+    )
+    db.commit()
+    return {"id": str(unit.id), "status": unit.status}
+
+
+@api_router.delete("/organization-units/{unit_id}")
+def delete_organization_unit(
+    unit_id: UUID,
+    user: User = require_permission("organization_units:delete"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Delete an organization unit — blocked if it has children, users, or business data."""
+    from app.modules.models import OrganizationUnit
+    from app.authz.hierarchy import (
+        count_active_children,
+        count_active_users_in_unit,
+        count_business_data_in_unit,
+    )
+
+    unit = db.get(OrganizationUnit, unit_id)
+    if unit is None:
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+    if str(unit.organization_id) != str(user.organization_id):
+        raise HTTPException(status_code=404, detail="组织单元不存在")
+
+    children = count_active_children(db, str(unit_id))
+    users = count_active_users_in_unit(db, str(unit_id))
+    business = count_business_data_in_unit(db, str(unit_id))
+
+    blockers: list[dict] = []
+    if children > 0:
+        blockers.append({"type": "children", "count": children})
+    if users > 0:
+        blockers.append({"type": "users", "count": users})
+    if business > 0:
+        blockers.append({"type": "business_data", "count": business})
+
+    if blockers:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "组织单元存在关联项，无法删除",
+                "blockers": blockers,
+            },
+        )
+
+    db.delete(unit)
+    audit = AuditLog(
+        actor_id=str(user.id),
+        action="organization_unit.delete",
+        entity_type="organization_unit",
+        entity_id=str(unit_id),
+        before={"name": unit.name, "code": unit.code},
+        organization_id=user.organization_id,
+    )
+    db.add(audit)
+    db.commit()
+    return {"deleted": True, "id": str(unit_id)}
+
+
+# ── Permission Catalog ───────────────────────────────────────────────────────
+
+
+@api_router.get("/permissions/catalog")
+def get_permission_catalog(
+    user: User = require_permission("roles:read"),
+) -> dict:
+    """Return the v1 permission catalog for building role editors."""
+    from app.authz.catalog import PERMISSION_CATALOG, PERMISSION_VERSION
+
+    return {
+        "version": PERMISSION_VERSION,
+        "catalog": PERMISSION_CATALOG,
+    }
 
 
 @api_router.get("/roles")
@@ -1982,15 +2878,28 @@ def list_roles(
 @api_router.post("/roles", status_code=status.HTTP_201_CREATED)
 def create_role(
     payload: RoleCreate,
-    user: User = require_permission("roles:write"),
+    user: User = require_permission("roles:create"),
     db: Session = Depends(get_db),
 ) -> dict:
-    from app.core.security import flatten_permissions, permissions_dominate, get_user_permissions
+    from app.authz.context import authorization_context
+    from app.core.security import (
+        data_scopes_dominate,
+        flatten_permissions,
+        get_user_permissions,
+        permissions_dominate,
+    )
 
-    if not permissions_dominate(get_user_permissions(db, user), flatten_permissions(payload.permissions)):
+    if not permissions_dominate(
+        get_user_permissions(db, user), flatten_permissions(payload.permissions)
+    ):
         raise HTTPException(status_code=403, detail="Cannot create a role with higher permissions")
+    actor_ctx = authorization_context(db, user)
+    if "admin:*" not in actor_ctx.permissions and not data_scopes_dominate(
+        actor_ctx.data_scopes, payload.data_scopes
+    ):
+        raise HTTPException(status_code=403, detail="Cannot create a role with a wider data scope")
     try:
-        role = services.create_role(db, payload)
+        role = services.create_role(db, payload, organization_id=user.organization_id)
         db.commit()
         db.refresh(role)
         return services.to_dict(role)
@@ -2002,19 +2911,36 @@ def create_role(
 def update_role(
     role_id: UUID,
     payload: RoleUpdate,
-    user: User = require_permission("roles:write"),
+    user: User = require_permission("roles:update"),
     db: Session = Depends(get_db),
 ) -> dict:
-    from app.core.security import get_user_permissions, get_role_effective_permissions, flatten_permissions, permissions_dominate
+    from app.authz.context import authorization_context
+    from app.core.security import (
+        data_scopes_dominate,
+        flatten_permissions,
+        get_role_effective_permissions,
+        get_user_permissions,
+        permissions_dominate,
+    )
 
     role = db.get(Role, role_id)
     if role is None:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if (
+        "admin:*" not in get_user_permissions(db, user)
+        and role.organization_id != user.organization_id
+    ):
         raise HTTPException(status_code=404, detail="Role not found")
     actor_permissions = get_user_permissions(db, user)
     if not permissions_dominate(actor_permissions, get_role_effective_permissions(db, role.id)):
         raise HTTPException(status_code=404, detail="Role not found")
     if not permissions_dominate(actor_permissions, flatten_permissions(payload.permissions)):
         raise HTTPException(status_code=403, detail="Cannot grant permissions higher than your own")
+    actor_ctx = authorization_context(db, user)
+    if "admin:*" not in actor_ctx.permissions and not data_scopes_dominate(
+        actor_ctx.data_scopes, payload.data_scopes
+    ):
+        raise HTTPException(status_code=403, detail="Cannot grant a wider data scope")
     services.update_role(db, role, payload)
     db.commit()
     db.refresh(role)
@@ -2034,13 +2960,18 @@ def list_users(
 @api_router.post("/users", status_code=status.HTTP_201_CREATED)
 def create_user(
     payload: UserCreate,
-    user: User = require_permission("users:write"),
+    user: User = require_permission("users:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     from app.core.security import can_assign_role
+    from app.modules.models import OrganizationUnit
 
     if not can_assign_role(db, user, payload.role_id):
         raise HTTPException(status_code=403, detail="Cannot assign a role with higher permissions")
+    if payload.organization_unit_id:
+        unit = db.get(OrganizationUnit, payload.organization_unit_id)
+        if unit is None or unit.status != "active" or unit.organization_id != user.organization_id:
+            raise HTTPException(status_code=404, detail="Organization unit not found")
     try:
         created = services.create_user(db, payload, organization_id=user.organization_id)
         db.commit()
@@ -2056,16 +2987,21 @@ def create_user(
 def update_user(
     user_id: UUID,
     payload: UserUpdate,
-    user: User = require_permission("users:write"),
+    user: User = require_permission("users:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     from app.core.security import can_assign_role, can_manage_user
+    from app.modules.models import OrganizationUnit
 
     target = db.get(User, user_id)
     if target is None or target.deleted_at is not None or not can_manage_user(db, user, target):
         raise HTTPException(status_code=404, detail="User not found")
     if "role_id" in payload.model_fields_set and not can_assign_role(db, user, payload.role_id):
         raise HTTPException(status_code=403, detail="Cannot assign a role with higher permissions")
+    if "organization_unit_id" in payload.model_fields_set and payload.organization_unit_id:
+        unit = db.get(OrganizationUnit, payload.organization_unit_id)
+        if unit is None or unit.status != "active" or unit.organization_id != user.organization_id:
+            raise HTTPException(status_code=404, detail="Organization unit not found")
     services.update_user(db, target, payload)
     db.commit()
     db.refresh(target)
@@ -2087,7 +3023,9 @@ def list_tags(
 
 @api_router.post("/tags", status_code=status.HTTP_201_CREATED)
 def create_tag(
-    payload: TagCreate, user: User = require_permission("tags:write"), db: Session = Depends(get_db)
+    payload: TagCreate,
+    user: User = require_permission("tags:create"),
+    db: Session = Depends(get_db),
 ) -> dict:
     try:
         tag = services.create_tag(db, payload)
@@ -2114,7 +3052,7 @@ def get_tag(
 def update_tag(
     tag_id: UUID,
     payload: TagUpdate,
-    user: User = require_permission("tags:write"),
+    user: User = require_permission("tags:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     tag = db.get(Tag, tag_id)
@@ -2132,7 +3070,7 @@ def update_tag(
 @api_router.delete("/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_tag(
     tag_id: UUID,
-    user: User = require_permission("tags:write"),
+    user: User = require_permission("tags:delete"),
     db: Session = Depends(get_db),
 ) -> None:
     tag = db.get(Tag, tag_id)
@@ -2156,7 +3094,7 @@ def list_custom_fields(
 @api_router.post("/custom-fields", status_code=status.HTTP_201_CREATED)
 def create_custom_field(
     payload: CustomFieldCreate,
-    user: User = require_permission("custom_fields:write"),
+    user: User = require_permission("custom_fields:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -2184,7 +3122,7 @@ def get_custom_field(
 def update_custom_field(
     field_id: UUID,
     payload: CustomFieldUpdate,
-    user: User = require_permission("custom_fields:write"),
+    user: User = require_permission("custom_fields:update"),
     db: Session = Depends(get_db),
 ) -> dict:
     field = db.get(CustomField, field_id)
@@ -2202,7 +3140,7 @@ def update_custom_field(
 @api_router.delete("/custom-fields/{field_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_custom_field(
     field_id: UUID,
-    user: User = require_permission("custom_fields:write"),
+    user: User = require_permission("custom_fields:delete"),
     db: Session = Depends(get_db),
 ) -> None:
     field = db.get(CustomField, field_id)
@@ -2230,7 +3168,7 @@ def assign_entity_tag(
     entity_type: Literal["brands", "contacts", "emails"],
     entity_id: UUID,
     tag_id: UUID,
-    user: User = require_permission("tags:write"),
+    user: User = require_permission("tags:assign"),
     db: Session = Depends(get_db),
 ) -> dict:
     tag = db.get(Tag, tag_id)
@@ -2258,7 +3196,7 @@ def remove_entity_tag(
     entity_type: Literal["brands", "contacts", "emails"],
     entity_id: UUID,
     tag_id: UUID,
-    user: User = require_permission("tags:write"),
+    user: User = require_permission("tags:assign"),
     db: Session = Depends(get_db),
 ) -> None:
     tag = db.get(Tag, tag_id)
@@ -2290,7 +3228,7 @@ def upsert_entity_custom_value(
     entity_id: UUID,
     field_id: UUID,
     payload: CustomValueUpsert,
-    user: User = require_permission("custom_fields:write"),
+    user: User = require_permission("custom_fields:assign"),
     db: Session = Depends(get_db),
 ) -> dict:
     field = db.get(CustomField, field_id)
@@ -2315,7 +3253,7 @@ def delete_entity_custom_value(
     entity_type: Literal["brands", "contacts", "emails"],
     entity_id: UUID,
     field_id: UUID,
-    user: User = require_permission("custom_fields:write"),
+    user: User = require_permission("custom_fields:assign"),
     db: Session = Depends(get_db),
 ) -> None:
     field = db.get(CustomField, field_id)
@@ -2348,7 +3286,7 @@ def list_blacklist(
 @api_router.post("/blacklist", status_code=status.HTTP_201_CREATED)
 def create_blacklist(
     payload: BlacklistCreate,
-    user: User = require_permission("blacklist:write"),
+    user: User = require_permission("blacklist:create"),
     db: Session = Depends(get_db),
 ) -> dict:
     item = services.create_blacklist(db, payload)

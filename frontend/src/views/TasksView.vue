@@ -2,6 +2,7 @@
   <div class="page-heading">
     <h1 class="page-title">搜索任务</h1>
     <div>
+      <DataAssignmentButton resource="tasks" :ids="selectedRows.map((row) => row.id)" @assigned="afterAssigned" />
       <el-button @click="aiDialogVisible = true">AI 协调任务</el-button>
       <el-button v-if="batchExactBrandEnabled" @click="$router.push('/batch-exact-brand')">批量精准品牌</el-button>
       <el-button type="primary" @click="dialogVisible = true">创建任务</el-button>
@@ -9,7 +10,7 @@
   </div>
 
   <div class="panel">
-    <EntityTable ref="table" endpoint="/search-tasks" :columns="columns">
+    <EntityTable ref="table" endpoint="/search-tasks" :columns="columns" selectable @selection-change="selectedRows = $event">
       <template #cell-mode="{ value }">
         {{ modeLabel(value) }}
       </template>
@@ -233,9 +234,16 @@
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
+import DataAssignmentButton from '../components/DataAssignmentButton.vue'
 import { api } from '../api/client'
 
 const table = ref<InstanceType<typeof EntityTable>>()
+const selectedRows = ref<Record<string, any>[]>([])
+
+async function afterAssigned() {
+  selectedRows.value = []
+  await table.value?.load()
+}
 const dialogVisible = ref(false)
 const aiDialogVisible = ref(false)
 const detailVisible = ref(false)
@@ -266,13 +274,15 @@ const vendorExecutionMode = ref<'apollo_only' | 'hunter_only' | 'apollo_hunter'>
 const vendorCapabilities = ref<Record<string, any>>({})
 const batchExactBrandEnabled = ref(false)
 const contactsLimitPerBrand = ref(5)
-const titles = ref('Head of Buying,Sourcing Manager')
+const titles = ref('')
 const form = reactive({ name: '', mode: 'brand_discovery', brand_limit: 100, min_relevance: 45, category_match_mode: 'any' })
 const modes = [
   { label: '品牌发现', value: 'brand_discovery' },
   { label: '精确品牌', value: 'exact_brand' },
 ]
 const columns: TableColumn[] = [
+  { key: 'department_name', label: '所属组', width: 130 },
+  { key: 'owner_name', label: '负责人', width: 110 },
   { key: 'name', label: '任务名称', width: 180 },
   { key: 'mode', label: '模式', width: 120 },
   { key: 'status', label: '状态', width: 110 },
@@ -308,6 +318,16 @@ async function loadBatchExactBrandCapability() {
     batchExactBrandEnabled.value = data?.enabled === true
   } catch {
     batchExactBrandEnabled.value = false
+  }
+}
+
+async function loadTaskDefaults() {
+  try {
+    const { data } = await api.get('/task-defaults')
+    titles.value = Array.isArray(data?.target_titles) ? data.target_titles.join(',') : ''
+    contactsLimitPerBrand.value = Number(data?.contacts_limit_per_brand || 5)
+  } catch {
+    titles.value = ''
   }
 }
 
@@ -434,7 +454,7 @@ function loadAiDraft(task: any) {
   aiDraft.categories = (task?.categories || []).join(', ')
   aiDraft.targetTitles = (task?.target_titles?.length
     ? task.target_titles
-    : ['Buyer', 'Head of Buying', 'Sourcing Manager', 'Procurement Manager']).join(', ')
+    : splitComma(titles.value)).join(', ')
   aiDraft.brandLimit = Number(task?.brand_limit || 100)
   aiDraft.contactsLimitPerBrand = Number(task?.contacts_limit_per_brand || 5)
   aiDraft.minRelevance = Number(task?.min_relevance ?? 45)
@@ -623,6 +643,7 @@ let timer: number | undefined
 onMounted(() => {
   loadVendorCapabilities()
   loadBatchExactBrandCapability()
+  loadTaskDefaults()
   timer = window.setInterval(() => table.value?.load(), 5000)
 })
 onUnmounted(() => { if (timer) window.clearInterval(timer) })

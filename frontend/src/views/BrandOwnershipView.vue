@@ -17,7 +17,7 @@
     </div>
 
     <div v-loading="loading" class="ownership-list">
-      <el-empty v-if="!loading && !items.length" description="暂无品牌数据" />
+      <el-empty v-if="!loading && !items.length && !sharedEmailRelationships.length" description="暂无本组或共享品牌数据" />
       <section v-for="brand in items" :key="brand.id" class="brand-branch">
         <article class="brand-node">
           <div class="brand-identity">
@@ -103,6 +103,31 @@
         </div>
         <div v-else-if="!brand.contacts?.length && !brand.brand_emails?.length" class="no-children">该品牌尚未关联联系人或邮箱。</div>
       </section>
+
+      <section v-if="sharedEmailRelationships.length" class="shared-email-section">
+        <div class="shared-email-heading">
+          <div>
+            <p class="section-kicker">SHARED EMAILS</p>
+            <h3>共享给本组的邮箱</h3>
+            <span>这些邮箱可供本组使用；下方仅展示其关联联系人和公司/品牌，不会将关联数据变为本组自有。</span>
+          </div>
+          <el-tag type="info">{{ sharedEmailRelationships.length }} 条组共享</el-tag>
+        </div>
+        <div class="shared-email-list">
+          <article v-for="relation in sharedEmailRelationships" :key="relation.email.id" class="shared-email-row">
+            <div class="node-mark email-mark">@</div>
+            <div class="shared-email-main">
+              <strong>{{ relation.email.address }}</strong>
+              <span>
+                联系人：{{ relation.contact?.name || '未关联联系人' }}
+                <template v-if="relation.brand"> · 公司/品牌：{{ relation.brand.company_name || relation.brand.name }}</template>
+              </span>
+            </div>
+            <el-tag size="small" type="info">组共享</el-tag>
+            <el-button link type="primary" @click="emit('open', 'emails')">查看邮箱</el-button>
+          </article>
+        </div>
+      </section>
     </div>
   </div>
 </template>
@@ -115,6 +140,7 @@ import { api } from '../api/client'
 const emit = defineEmits<{ (event: 'open', tab: string): void }>()
 const loading = ref(false)
 const items = ref<any[]>([])
+const sharedEmailRelationships = ref<any[]>([])
 const expandedBrandIds = ref<Set<string | number>>(new Set())
 const overview = computed(() => items.value.reduce((total, brand) => ({
   brands: total.brands + 1,
@@ -127,6 +153,7 @@ async function load() {
   try {
     const { data } = await api.get('/brands/hierarchy', { params: { page_size: 100 } })
     items.value = data.items || []
+    sharedEmailRelationships.value = data.shared_email_relationships || []
     const visibleIds = new Set(items.value.map((brand) => brand.id))
     expandedBrandIds.value = new Set(
       [...expandedBrandIds.value].filter((brandId) => visibleIds.has(brandId)),
@@ -196,6 +223,16 @@ onMounted(load)
 .overview-metrics span { margin-top: 3px; color: #8090a1; font-size: 10px; }
 
 .ownership-list { min-height: 150px; column-count: 2; column-gap: 14px; }
+.shared-email-section { break-inside: avoid; margin-bottom: 14px; padding: 16px; border: 1px solid #cfe0ee; border-radius: 13px; background: #fbfdff; box-shadow: 0 7px 20px rgba(35, 74, 109, .06); }
+.shared-email-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; padding-bottom: 12px; border-bottom: 1px solid #e3edf5; }
+.shared-email-heading h3 { margin: 0; color: #173551; font-size: 16px; }
+.shared-email-heading span { display: block; margin-top: 4px; color: #718096; font-size: 12px; line-height: 1.5; }
+.shared-email-list { display: grid; gap: 8px; margin-top: 12px; }
+.shared-email-row { display: flex; gap: 10px; align-items: center; padding: 10px; border: 1px solid #e2ebf3; border-radius: 9px; background: #fff; }
+.shared-email-main { display: grid; min-width: 0; flex: 1; gap: 3px; }
+.shared-email-main strong, .shared-email-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shared-email-main strong { color: #173551; font-size: 13px; }
+.shared-email-main span { color: #718096; font-size: 11px; }
 .brand-branch { position: relative; display: inline-block; overflow: hidden; width: 100%; margin-bottom: 14px; break-inside: avoid; border: 1px solid #cfe0ee; border-radius: 13px; background: #fff; box-shadow: 0 7px 20px rgba(35, 74, 109, .08); }
 .brand-branch::before { position: absolute; z-index: 2; top: 0; bottom: 0; left: 0; width: 4px; background: linear-gradient(180deg, #2e83d5 0%, #62afea 42%, #9b70dc 100%); content: ''; }
 .brand-node { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; align-items: center; padding: 13px 14px 12px 18px; background: linear-gradient(110deg, #eef7ff 0%, #f7fbff 56%, #fff 100%); }
@@ -265,6 +302,8 @@ onMounted(load)
   .contact-status { margin-left: 44px; }
   .email-rail { padding-left: 56px; }
   .no-children { padding: 16px 58px; }
+  .shared-email-row { flex-wrap: wrap; }
+  .shared-email-main { flex-basis: calc(100% - 46px); }
 }
 
 @media (max-width: 480px) {

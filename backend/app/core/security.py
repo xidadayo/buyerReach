@@ -69,21 +69,31 @@ def has_permission(role_name: str, permission: str) -> bool:
 
 
 def flatten_permissions(value: dict) -> set[str]:
-    permissions: set[str] = set()
-    for resource, actions in value.items():
-        if isinstance(actions, list):
-            permissions.update(f"{resource}:{action}" for action in actions)
-        elif isinstance(actions, str):
-            permissions.add(f"{resource}:{actions}")
-    return permissions
+    from app.authz.catalog import flatten_permissions as flatten_v1_permissions
+
+    return flatten_v1_permissions(value)
+
+
+def _expand_permission_set(permissions: set[str]) -> set[str]:
+    from app.authz.catalog import V1_COMPAT_MAP
+
+    expanded = set(permissions)
+    for permission in permissions:
+        expanded.update(V1_COMPAT_MAP.get(permission, []))
+    return expanded
 
 
 def get_user_permissions(db: Session, user: User) -> set[str]:
     role_name = "viewer"
     role = db.get(Role, user.role_id) if user.role_id else None
+    if role is not None and (
+        role.status != "active"
+        or (role.organization_id is not None and role.organization_id != user.organization_id)
+    ):
+        return set()
     if role is not None:
         role_name = role.name
-    permissions = get_role_permissions(role_name)
+    permissions = _expand_permission_set(get_role_permissions(role_name))
     if role is not None:
         permissions = permissions | flatten_permissions(role.permissions or {})
     return permissions
@@ -91,8 +101,10 @@ def get_user_permissions(db: Session, user: User) -> set[str]:
 
 def get_role_effective_permissions(db: Session, role_id: object | None) -> set[str]:
     role = db.get(Role, role_id) if role_id else None
+    if role is not None and role.status != "active":
+        return set()
     role_name = role.name if role is not None else "viewer"
-    permissions = get_role_permissions(role_name)
+    permissions = _expand_permission_set(get_role_permissions(role_name))
     if role is not None:
         permissions = permissions | flatten_permissions(role.permissions or {})
     return permissions
@@ -104,9 +116,21 @@ def permissions_dominate(actor_permissions: set[str], target_permissions: set[st
 
 
 def can_assign_role(db: Session, actor: User, role_id: object | None) -> bool:
+    role = db.get(Role, role_id) if role_id else None
+    if role is not None and "admin:*" not in get_user_permissions(db, actor):
+        if role.organization_id != actor.organization_id:
+            return False
     return permissions_dominate(
         get_user_permissions(db, actor),
         get_role_effective_permissions(db, role_id),
+    )
+
+
+def data_scopes_dominate(actor_scopes: dict, target_scopes: dict) -> bool:
+    ranks = {"self": 0, "unit": 1, "unit_and_children": 2, "organization": 3, "all": 4}
+    return all(
+        ranks.get(target_scope, -1) <= ranks.get(actor_scopes.get(resource, "self"), -1)
+        for resource, target_scope in target_scopes.items()
     )
 
 

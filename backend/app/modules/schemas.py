@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -291,10 +292,91 @@ class AITaskPlanRead(BaseModel):
 class RoleCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     permissions: dict[str, list[str]] = Field(default_factory=dict)
+    data_scopes: dict[str, Literal["self", "unit", "unit_and_children", "organization", "all"]] = Field(default_factory=dict)
 
 
 class RoleUpdate(BaseModel):
     permissions: dict[str, list[str]] = Field(default_factory=dict)
+    data_scopes: dict[str, Literal["self", "unit", "unit_and_children", "organization", "all"]] = Field(default_factory=dict)
+    status: Literal["active", "disabled"] | None = None
+
+
+class DataAssignmentRequest(BaseModel):
+    resource: Literal["tasks", "brands", "contacts", "emails"]
+    ids: list[UUID] = Field(min_length=1, max_length=500)
+    target_organization_unit_id: UUID
+    target_owner_id: UUID | None = None
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class DataShareRequest(BaseModel):
+    resource: Literal["tasks", "brands", "contacts", "emails"]
+    ids: list[UUID] = Field(min_length=1, max_length=500)
+    target_organization_unit_id: UUID
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class EmailTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    subject: str = Field(min_length=1, max_length=500)
+    body_html: str = Field(min_length=1, max_length=100000)
+    body_text: str = Field(min_length=1, max_length=100000)
+    variable_defaults: dict[str, str] = Field(default_factory=dict)
+    missing_variable_policy: Literal["block", "fallback"] = "block"
+
+
+class EmailTemplatePreview(BaseModel):
+    email_id: UUID
+
+
+class OutreachAIDraftRequest(BaseModel):
+    email_id: UUID | None = None
+    goal: str = Field(min_length=3, max_length=1000)
+    language: str = Field(default="中文", max_length=30)
+    tone: str = Field(default="专业、简洁", max_length=80)
+    use_website_evidence: bool = True
+
+
+class OutreachCampaignSettings(BaseModel):
+    timezone: str = Field(default="Asia/Shanghai", max_length=80)
+    send_window_start: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    send_window_end: str = Field(default="18:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4], min_length=1, max_length=7)
+    daily_limit: int = Field(default=50, ge=1, le=10000)
+
+
+class OutreachCampaignCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    sending_account_id: UUID | None = None
+    steps: list[dict] = Field(min_length=1, max_length=20)
+    email_ids: list[UUID] = Field(min_length=1, max_length=2000)
+    settings: OutreachCampaignSettings = Field(default_factory=OutreachCampaignSettings)
+
+
+class SendingAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    from_email: EmailStr
+    from_name: str | None = Field(default=None, max_length=160)
+    daily_limit: int = Field(default=50, ge=1, le=10000)
+
+
+class OutreachEventIngest(BaseModel):
+    email_id: UUID
+    event_type: Literal["reply", "unsubscribe", "bounce", "complaint"]
+    provider_event_id: str | None = Field(default=None, max_length=255)
+    message_id: UUID | None = None
+    occurred_at: datetime | None = None
+    payload: dict = Field(default_factory=dict)
+
+
+class DataMigrationCreate(BaseModel):
+    source_type: Literal["legacy_system", "csv", "api"]
+    source_fingerprint: str = Field(min_length=16, max_length=128)
+    rows: list[dict] = Field(min_length=1, max_length=5000)
+
+
+class DataMigrationApply(BaseModel):
+    resolutions: dict[str, Literal["create", "merge", "skip"]] = Field(default_factory=dict)
 
 
 class UserCreate(BaseModel):
@@ -303,6 +385,7 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     role_id: UUID | None = None
     department_id: UUID | None = None
+    organization_unit_id: UUID | None = None
     status: Literal["active", "disabled"] = "active"
 
     @field_validator("email")
@@ -321,6 +404,7 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8, max_length=128)
     role_id: UUID | None = None
     department_id: UUID | None = None
+    organization_unit_id: UUID | None = None
     status: Literal["active", "disabled"] | None = None
 
 

@@ -6,7 +6,7 @@ from jose import JWTError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import decode_token, get_role_permissions, get_user_by_id
+from app.core.security import decode_token, get_user_by_id
 from app.modules.models import SearchTask, User
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -52,19 +52,10 @@ class RequirePermission:
         self.permission = permission
 
     async def __call__(self, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
-        role_name = "viewer"
-        role = None
-        if user.role_id:
-            from app.modules.models import Role
-            role = db.get(Role, user.role_id)
-            if role:
-                role_name = role.name
-        permissions = get_role_permissions(role_name)
-        if role:
-            from app.core.security import flatten_permissions
+        from app.authz.context import authorization_context
 
-            permissions = permissions | flatten_permissions(role.permissions or {})
-        if "admin:*" not in permissions and self.permission not in permissions:
+        ctx = authorization_context(db, user)
+        if not ctx.has_permission(self.permission):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
         return user
 
@@ -82,11 +73,14 @@ def require_task_access(
     user: User,
 ) -> SearchTask:
     """Load a task row, verify organization ownership. 404 when absent or cross-org."""
-    task = db.get(SearchTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Search task not found")
-    task_org = str(task.organization_id) if task.organization_id is not None else None
-    user_org = str(user.organization_id) if user.organization_id is not None else None
-    if task_org is not None and task_org != user_org:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Search task not found")
-    return task
+    from app.authz.context import authorization_context
+    from app.authz.policy import load_scoped_entity
+
+    return load_scoped_entity(
+        db,
+        SearchTask,
+        task_id,
+        authorization_context(db, user),
+        resource="tasks",
+        not_found_message="Search task not found",
+    )

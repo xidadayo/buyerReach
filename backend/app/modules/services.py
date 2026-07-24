@@ -41,6 +41,7 @@ from app.modules.models import (
     EmailAddress,
     EmailVerification,
     EntityTag,
+    OrganizationUnit,
     ProviderConfig,
     RelevanceScoreHistory,
     SearchQueryPlan,
@@ -56,6 +57,7 @@ from app.modules.models import (
     VendorStrategy,
     CustomField,
     CustomValue,
+    DataShareGrant,
     Role,
     User,
     Website,
@@ -155,16 +157,66 @@ def list_page(db: Session, model: type, page: int = 1, page_size: int = 50) -> d
     return page_result(total, page, page_size, [to_dict(item) for item in items])
 
 
+def add_ownership_labels(db: Session, items: list[dict]) -> list[dict]:
+    """Add human-readable unit and owner labels without per-row queries."""
+    unit_ids = {
+        UUID(str(item["department_id"]))
+        for item in items
+        if item.get("department_id")
+    }
+    owner_ids = {
+        UUID(str(item["owner_id"]))
+        for item in items
+        if item.get("owner_id")
+    }
+    unit_names = {
+        str(unit.id): unit.name
+        for unit in db.scalars(
+            select(OrganizationUnit).where(OrganizationUnit.id.in_(unit_ids))
+        )
+    } if unit_ids else {}
+    owner_names = {
+        str(owner.id): owner.name
+        for owner in db.scalars(select(User).where(User.id.in_(owner_ids)))
+    } if owner_ids else {}
+    for item in items:
+        item["department_name"] = unit_names.get(str(item.get("department_id")), "未分组")
+        item["owner_name"] = owner_names.get(str(item.get("owner_id")), "组共享")
+    return items
+
+
+def _shared_group_emails(db: Session, authorization) -> list[EmailAddress]:
+    """Emails shared with the current scope but not owned by an individual."""
+    if authorization is None:
+        return []
+    from app.authz.scope import apply_scope
+
+    statement = apply_scope(
+        select(EmailAddress)
+        .where(EmailAddress.deleted_at.is_(None), EmailAddress.owner_id.is_(None)),
+        EmailAddress,
+        db,
+        authorization,
+        "emails",
+    )
+    return list(db.scalars(statement))
+
+
 def list_search_tasks(
     db: Session,
     page: int = 1,
     page_size: int = 50,
     organization_id: UUID | None = None,
+    authorization=None,
 ) -> dict:
     """List active task history while keeping cancelled records for audit access."""
     statement = select(SearchTask).where(SearchTask.status != TaskStatus.cancelled)
     if organization_id is not None:
         statement = statement.where(SearchTask.organization_id == organization_id)
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        statement = apply_scope(statement, SearchTask, db, authorization, "tasks", include_shared=True)
     total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     items = db.scalars(
         statement.order_by(SearchTask.created_at.desc())
@@ -196,10 +248,10 @@ def list_search_tasks(
             }
             result[i]["progress"] = {**result[i].get("progress", {}), **batch_progress}
 
-    return page_result(total, page, page_size, result)
+    return page_result(total, page, page_size, add_ownership_labels(db, result))
 
 
-def list_brands(db: Session, page: int, page_size: int) -> dict:
+def list_brands(db: Session, page: int, page_size: int, *, authorization=None) -> dict:
     current_brand_contact_ids = (
         select(ContactPosition.contact_id)
         .join(Contact, ContactPosition.contact_id == Contact.id)
@@ -232,6 +284,10 @@ def list_brands(db: Session, page: int, page_size: int) -> dict:
         )
         .order_by(Brand.created_at.desc())
     )
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        statement = apply_scope(statement, Brand, db, authorization, "brands", include_shared=True)
     total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     rows = db.execute(statement.offset((page - 1) * page_size).limit(page_size)).all()
     brand_ids = [str(brand.id) for brand, _company_name, _email_count in rows]
@@ -260,10 +316,42 @@ def list_brands(db: Session, page: int, page_size: int) -> dict:
             "evaluated" if str(brand.id) in evaluated_brand_ids else "pending"
         )
         items.append(item)
-    return page_result(total, page, page_size, items)
+    visible_ids = {str(item["id"]) for item in items}
+    shared_by_brand: dict[UUID, list[EmailAddress]] = {}
+    for email in _shared_group_emails(db, authorization):
+        if email.brand_id:
+            shared_by_brand.setdefault(email.brand_id, []).append(email)
+    if shared_by_brand:
+        shared_rows = db.execute(
+            select(Brand, Company.legal_name)
+            .outerjoin(Company, Brand.company_id == Company.id)
+            .where(Brand.id.in_(set(shared_by_brand)))
+        ).all()
+        for brand, company_name in shared_rows:
+            if str(brand.id) in visible_ids:
+                continue
+            item = to_dict(brand)
+            item.update(
+                {
+                    "company_name": company_name,
+                    "email_count": len(shared_by_brand[brand.id]),
+                    "industry_status": "available" if brand.category else "missing",
+                    "relevance_status": "pending",
+                    "is_shared_context": True,
+                    "department_name": "共享关联",
+                    "owner_name": "只读",
+                }
+            )
+            items.append(item)
+    result = page_result(total + sum(1 for item in items if item.get("is_shared_context")), page, page_size, add_ownership_labels(db, items))
+    for item in result["items"]:
+        if item.get("is_shared_context"):
+            item["department_name"] = "共享关联"
+            item["owner_name"] = "只读"
+    return result
 
 
-def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
+def list_brand_hierarchy(db: Session, page: int, page_size: int, *, authorization=None) -> dict:
     brand_statement = (
         select(Brand)
         .where(
@@ -272,13 +360,15 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
         )
         .order_by(Brand.created_at.desc())
     )
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        brand_statement = apply_scope(brand_statement, Brand, db, authorization, "brands")
     total = db.scalar(select(func.count()).select_from(brand_statement.subquery())) or 0
     brands = db.scalars(brand_statement.offset((page - 1) * page_size).limit(page_size)).all()
-    if not brands:
-        return page_result(total, page, page_size, [])
 
     brand_ids = [brand.id for brand in brands]
-    positions = db.execute(
+    positions_statement = (
         select(ContactPosition, Contact)
         .join(Contact, ContactPosition.contact_id == Contact.id)
         .where(
@@ -288,7 +378,14 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
             Contact.deleted_at.is_(None),
         )
         .order_by(Contact.full_name)
-    ).all()
+    )
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        positions_statement = apply_scope(
+            positions_statement, Contact, db, authorization, "contacts"
+        )
+    positions = db.execute(positions_statement).all()
     contacts_by_brand: dict[UUID, list[dict]] = {brand_id: [] for brand_id in brand_ids}
     # A contact may hold current positions at more than one brand. Keep every
     # brand-specific view instead of overwriting the first one by contact ID.
@@ -298,7 +395,7 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
         contacts_by_brand[position.brand_id].append(item)
         contacts_by_id.setdefault(contact.id, []).append(item)
 
-    emails = db.scalars(
+    emails_statement = (
         select(EmailAddress)
         .where(
             EmailAddress.deleted_at.is_(None),
@@ -308,7 +405,14 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
             ),
         )
         .order_by(EmailAddress.address)
-    ).all()
+    )
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        emails_statement = apply_scope(
+            emails_statement, EmailAddress, db, authorization, "emails"
+        )
+    emails = db.scalars(emails_statement).all()
     direct_emails_by_brand: dict[UUID, list[dict]] = {brand_id: [] for brand_id in brand_ids}
     for email in emails:
         email_item = to_dict(email)
@@ -327,6 +431,83 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
             contact["email_count"] = len(contact_emails)
             contact["valid_email_count"] = valid_email_count
             contact["is_valid"] = valid_email_count > 0
+
+    # A group-shared email can retain a relationship to a contact or brand
+    # outside the viewer's normal brand scope. It is still a record the group
+    # is authorized to use, so expose it in a separate, explicitly labelled
+    # section rather than silently dropping it or presenting it as local data.
+    shared_email_relationships: list[dict] = []
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        visible_email_ids = [email.id for email in emails]
+        shared_statement = select(EmailAddress).where(
+            EmailAddress.deleted_at.is_(None),
+            EmailAddress.owner_id.is_(None),
+        )
+        if visible_email_ids:
+            shared_statement = shared_statement.where(EmailAddress.id.notin_(visible_email_ids))
+        shared_statement = apply_scope(
+            shared_statement, EmailAddress, db, authorization, "emails"
+        )
+        shared_emails = db.scalars(shared_statement.order_by(EmailAddress.address)).all()
+        if shared_emails:
+            contact_ids = {email.contact_id for email in shared_emails if email.contact_id}
+            related_brand_ids = {email.brand_id for email in shared_emails if email.brand_id}
+            related_contacts = {
+                contact.id: contact
+                for contact in db.scalars(
+                    select(Contact).where(Contact.id.in_(contact_ids))
+                )
+            } if contact_ids else {}
+            related_brands = {
+                brand.id: brand
+                for brand in db.scalars(select(Brand).where(Brand.id.in_(related_brand_ids)))
+            } if related_brand_ids else {}
+            company_ids = {
+                brand.company_id for brand in related_brands.values() if brand.company_id
+            }
+            company_names = {
+                company.id: company.legal_name
+                for company in db.scalars(select(Company).where(Company.id.in_(company_ids)))
+            } if company_ids else {}
+            related_unit_ids = {
+                entity.department_id
+                for entity in [*related_contacts.values(), *related_brands.values()]
+                if entity.department_id
+            }
+            related_unit_names = {
+                unit.id: unit.name
+                for unit in db.scalars(
+                    select(OrganizationUnit).where(OrganizationUnit.id.in_(related_unit_ids))
+                )
+            } if related_unit_ids else {}
+            for email in add_ownership_labels(db, [to_dict(item) for item in shared_emails]):
+                contact = related_contacts.get(UUID(str(email["contact_id"]))) if email.get("contact_id") else None
+                brand = related_brands.get(UUID(str(email["brand_id"]))) if email.get("brand_id") else None
+                shared_email_relationships.append(
+                    {
+                        "email": email,
+                        "contact": (
+                            {
+                                "id": str(contact.id),
+                                "name": contact.full_name,
+                                "department_name": related_unit_names.get(contact.department_id),
+                            }
+                            if contact is not None
+                            else None
+                        ),
+                        "brand": (
+                            {
+                                "id": str(brand.id),
+                                "name": brand.name,
+                                "company_name": company_names.get(brand.company_id),
+                            }
+                            if brand is not None
+                            else None
+                        ),
+                    }
+                )
 
     items = []
     for brand in brands:
@@ -350,7 +531,9 @@ def list_brand_hierarchy(db: Session, page: int, page_size: int) -> dict:
             }
         )
         items.append(item)
-    return page_result(total, page, page_size, items)
+    result = page_result(total, page, page_size, add_ownership_labels(db, items))
+    result["shared_email_relationships"] = shared_email_relationships
+    return result
 
 
 def list_contacts(
@@ -359,6 +542,7 @@ def list_contacts(
     page_size: int,
     search: str | None = None,
     organization_id: UUID | None = None,
+    authorization=None,
 ) -> dict:
     email_count = (
         select(func.count(EmailAddress.id))
@@ -453,11 +637,18 @@ def list_contacts(
         .where(*filters)
         .order_by(Contact.created_at.desc())
     )
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        statement = apply_scope(statement, Contact, db, authorization, "contacts", include_shared=True)
+        scoped_ids = apply_scope(
+            select(Contact.id).where(*filters), Contact, db, authorization, "contacts", include_shared=True
+        )
+    else:
+        scoped_ids = select(Contact.id).where(*filters)
     total = (
         db.scalar(
-            select(func.count()).select_from(
-                select(Contact.id).where(*filters).subquery()
-            )
+            select(func.count()).select_from(scoped_ids.subquery())
         )
         or 0
     )
@@ -475,7 +666,44 @@ def list_contacts(
             }
         )
         items.append(item)
-    return page_result(total, page, page_size, items)
+    visible_ids = {str(item["id"]) for item in items}
+    shared_by_contact: dict[UUID, list[EmailAddress]] = {}
+    for email in _shared_group_emails(db, authorization):
+        if email.contact_id:
+            shared_by_contact.setdefault(email.contact_id, []).append(email)
+    if shared_by_contact:
+        shared_rows = db.execute(
+            select(Contact, position_title.label("title"), position_brand_name.label("brand_name"))
+            .where(Contact.id.in_(set(shared_by_contact)), *filters)
+        ).all()
+        for contact, title, brand_name in shared_rows:
+            if str(contact.id) in visible_ids:
+                continue
+            emails_for_contact = shared_by_contact[contact.id]
+            item = to_dict(contact)
+            item.update(
+                {
+                    "title": title,
+                    "brand_name": brand_name,
+                    "email_count": len(emails_for_contact),
+                    "valid_email_count": sum(
+                        1 for email in emails_for_contact if _email_makes_contact_valid(email)
+                    ),
+                    "is_valid": any(
+                        _email_makes_contact_valid(email) for email in emails_for_contact
+                    ),
+                    "is_shared_context": True,
+                    "department_name": "共享关联",
+                    "owner_name": "只读",
+                }
+            )
+            items.append(item)
+    result = page_result(total + sum(1 for item in items if item.get("is_shared_context")), page, page_size, add_ownership_labels(db, items))
+    for item in result["items"]:
+        if item.get("is_shared_context"):
+            item["department_name"] = "共享关联"
+            item["owner_name"] = "只读"
+    return result
 
 
 def list_emails(
@@ -487,6 +715,7 @@ def list_emails(
     pool: str | None = None,
     min_confidence: int | None = None,
     brand_id: UUID | None = None,
+    authorization=None,
 ) -> dict:
     filters = [EmailAddress.deleted_at.is_(None)]
     if contact_id is not None:
@@ -521,9 +750,15 @@ def list_emails(
         .where(*filters)
         .order_by(EmailAddress.created_at.desc())
     )
+    scoped_ids = select(EmailAddress.id).where(*filters)
+    if authorization is not None:
+        from app.authz.scope import apply_scope
+
+        statement = apply_scope(statement, EmailAddress, db, authorization, "emails", include_shared=True)
+        scoped_ids = apply_scope(scoped_ids, EmailAddress, db, authorization, "emails", include_shared=True)
     total = (
         db.scalar(
-            select(func.count()).select_from(select(EmailAddress.id).where(*filters).subquery())
+            select(func.count()).select_from(scoped_ids.subquery())
         )
         or 0
     )
@@ -534,7 +769,7 @@ def list_emails(
         item["contact_name"] = contact_name
         item["brand_name"] = brand_name
         items.append(item)
-    return page_result(total, page, page_size, items)
+    return page_result(total, page, page_size, add_ownership_labels(db, items))
 
 
 def list_task_items(db: Session, task_id: UUID, page: int, page_size: int) -> dict:
@@ -565,6 +800,7 @@ def create_search_task(
     *,
     organization_id: UUID | None = None,
     owner_id: UUID | None = None,
+    organization_unit_id: UUID | None = None,
 ) -> SearchTask:
     if payload.selected_vendors is not None:
         unavailable: list[str] = []
@@ -625,6 +861,7 @@ def create_search_task(
     task = SearchTask(
         organization_id=organization_id,
         owner_id=owner_id,
+        department_id=organization_unit_id,
         name=payload.name,
         mode=payload.mode,
         status=TaskStatus.draft,
@@ -711,6 +948,7 @@ def copy_search_task(db: Session, task_id: UUID) -> SearchTask:
         copied_filters["category_match_mode"] = "any"
     task = SearchTask(
         organization_id=source.organization_id,
+        department_id=source.department_id,
         owner_id=source.owner_id,
         name=f"{source.name} (copy)",
         mode=source.mode,
@@ -770,6 +1008,15 @@ def execute_search_task(db: Session, task_id: UUID) -> SearchTask:
     db.commit()
     active_stage = None
     try:
+        # ── Batch exact brand: execution is target-driven, skip normal pipeline ──
+        if task.mode == "batch_exact_brand":
+            # The schedule_batch_targets job picks up individual targets.
+            # We just transition from queued → running so the UI reflects progress.
+            transition_task(task, TaskStatus.running)
+            emit(db, "task.running", {"task_id": task.id, "mode": "batch_exact_brand"})
+            audit(db, "search_task.start", "search_task", str(task.id))
+            return task
+
         if task.pipeline_version == PIPELINE_V2.pipeline_version:
             intent = SearchIntent.model_validate(task.search_intent)
             parsing_run = begin_stage(db, task.id, "intent_parsing", {"intent": task.search_intent})
@@ -1155,6 +1402,9 @@ def _ingest_discovery(
             source_title=company_payload.get("source_title"),
             source_excerpt=company_payload.get("source_excerpt"),
             discovery_score=int(company_payload.get("relevance_score") or 0),
+            organization_id=task.organization_id,
+            organization_unit_id=task.department_id,
+            owner_id=task.owner_id,
         )
         db.add(
             TaskItem(
@@ -1236,6 +1486,8 @@ def _ingest_discovery(
                 ),
                 provider=contact_provider.provider,
                 organization_id=task.organization_id,
+                organization_unit_id=task.department_id,
+                owner_id=task.owner_id,
             )
             _record_task_result(
                 db,
@@ -1260,6 +1512,9 @@ def _ingest_discovery(
                     db,
                     EmailCreate(contact_id=contact.id, address=address, type="personal"),
                     provider=contact_provider.provider,
+                    organization_id=task.organization_id,
+                    organization_unit_id=task.department_id,
+                    owner_id=task.owner_id,
                 )
                 _record_task_result(
                     db, task, "email", email.id, "email_enriched", contact_provider.provider
@@ -1288,6 +1543,9 @@ def _ingest_discovery(
                                     type=str(email_payload.get("type") or "personal"),
                                 ),
                                 provider=email_provider.provider,
+                                organization_id=task.organization_id,
+                                organization_unit_id=task.department_id,
+                                owner_id=task.owner_id,
                             )
                             _record_task_result(
                                 db,
@@ -1315,6 +1573,9 @@ def _ingest_discovery(
                                 type="personal",
                             ),
                             provider="pattern_inference",
+                            organization_id=task.organization_id,
+                            organization_unit_id=task.department_id,
+                            owner_id=task.owner_id,
                         )
                         db.add(
                             SourceEvidence(
@@ -2274,6 +2535,8 @@ def _discover_emails_by_domain(
                 ),
                 provider=provider.provider,
                 organization_id=task.organization_id,
+                organization_unit_id=task.department_id,
+                owner_id=task.owner_id,
             )
             contact_id = contact.id
             _record_task_result(
@@ -2293,6 +2556,9 @@ def _discover_emails_by_domain(
                 type=str(email_payload.get("type") or "personal"),
             ),
             provider=provider.provider,
+            organization_id=task.organization_id,
+            organization_unit_id=task.department_id,
+            owner_id=task.owner_id,
         )
         _record_task_result(
             db,
@@ -2439,6 +2705,8 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
         email = db.scalar(
             select(EmailAddress).where(
                 EmailAddress.normalized_address == parsed.address.lower(),
+                EmailAddress.organization_id == brand.organization_id,
+                EmailAddress.department_id == brand.department_id,
                 EmailAddress.deleted_at.is_(None),
             )
         )
@@ -2452,6 +2720,9 @@ def _parse_brand_website(db: Session, task: SearchTask | None, brand: Brand) -> 
                 status=EmailStatus.raw,
                 pool=EmailPool.raw,
                 provider="website_parser",
+                organization_id=brand.organization_id,
+                department_id=brand.department_id,
+                owner_id=brand.owner_id,
             )
             db.add(email)
             db.flush()
@@ -2741,10 +3012,20 @@ def create_brand(
     source_title: str | None = None,
     source_excerpt: str | None = None,
     discovery_score: int = 0,
+    organization_id: UUID | None = None,
+    organization_unit_id: UUID | None = None,
+    owner_id: UUID | None = None,
 ) -> Brand:
     normalized_name = slugify(payload.name)
     existing = db.scalar(
-        select(Brand).where(Brand.normalized_name == normalized_name, Brand.deleted_at.is_(None))
+        select(Brand).where(
+            Brand.normalized_name == normalized_name,
+            Brand.organization_id == organization_id,
+            Brand.department_id.is_(None)
+            if organization_unit_id is None
+            else Brand.department_id == organization_unit_id,
+            Brand.deleted_at.is_(None),
+        )
     )
     if existing:
         if payload.category and not existing.category:
@@ -2770,6 +3051,9 @@ def create_brand(
         category=payload.category,
         status="new",
         discovery_score=max(0, min(100, discovery_score)),
+        organization_id=organization_id,
+        department_id=organization_unit_id,
+        owner_id=owner_id,
     )
     db.add(brand)
     db.flush()
@@ -2890,6 +3174,7 @@ def approve_discovery_brand(db: Session, brand: Brand) -> SearchTask:
             brand_limit=1,
         ),
         organization_id=brand.organization_id,
+        organization_unit_id=brand.department_id,
         owner_id=brand.owner_id,
     )
     audit(
@@ -2965,17 +3250,28 @@ def create_contact(
     payload: ContactCreate,
     provider: str = "manual",
     organization_id: UUID | None = None,
+    organization_unit_id: UUID | None = None,
+    owner_id: UUID | None = None,
 ) -> Contact:
+    # Contacts created for an existing brand must inherit its tenancy even when
+    # the caller is an older/manual integration that did not pass scope fields.
+    if payload.brand_id is not None and (organization_id is None or organization_unit_id is None):
+        brand = db.get(Brand, payload.brand_id)
+        if brand is not None:
+            organization_id = organization_id or brand.organization_id
+            organization_unit_id = organization_unit_id or brand.department_id
+            owner_id = owner_id or brand.owner_id
     full_name = f"{payload.first_name} {payload.last_name}".strip()
     normalized_name = _normalized_contact_text(full_name)
     normalized_title = _normalized_contact_text(payload.title)
     normalized_linkedin = _normalized_linkedin_url(payload.linkedin_url)
     organization_key = str(organization_id or "unscoped")
+    unit_key = str(organization_unit_id or "unscoped")
     scope_key = str(payload.brand_id or payload.company_id or "unscoped")
     identity_key = (
-        f"org:{organization_key}|linkedin:{normalized_linkedin}"
+        f"org:{organization_key}|unit:{unit_key}|linkedin:{normalized_linkedin}"
         if normalized_linkedin
-        else f"org:{organization_key}|scope:{scope_key}|name:{normalized_name}|title:{normalized_title}"
+        else f"org:{organization_key}|unit:{unit_key}|scope:{scope_key}|name:{normalized_name}|title:{normalized_title}"
     )
     _lock_contact_identity(db, identity_key)
 
@@ -2989,6 +3285,11 @@ def create_contact(
             Contact.organization_id.is_(None)
             if organization_id is None
             else Contact.organization_id == organization_id
+        )
+        linkedin_query = linkedin_query.where(
+            Contact.department_id.is_(None)
+            if organization_unit_id is None
+            else Contact.department_id == organization_unit_id
         )
         existing = db.scalar(linkedin_query.limit(1))
     if existing is None:
@@ -3018,6 +3319,11 @@ def create_contact(
             if organization_id is None
             else Contact.organization_id == organization_id
         )
+        query = query.where(
+            Contact.department_id.is_(None)
+            if organization_unit_id is None
+            else Contact.department_id == organization_unit_id
+        )
         existing = db.scalar(query.limit(1))
     if existing is not None:
         ensure_contact_position(
@@ -3031,6 +3337,8 @@ def create_contact(
         linkedin_url=payload.linkedin_url,
         status="invalid",
         organization_id=organization_id,
+        department_id=organization_unit_id,
+        owner_id=owner_id,
     )
     db.add(contact)
     db.flush()
@@ -3103,12 +3411,36 @@ def update_contact(db: Session, contact: Contact, payload: ContactUpdate) -> Con
     return contact
 
 
-def create_email(db: Session, payload: EmailCreate, provider: str = "manual") -> EmailAddress:
+def create_email(
+    db: Session,
+    payload: EmailCreate,
+    provider: str = "manual",
+    *,
+    organization_id: UUID | None = None,
+    organization_unit_id: UUID | None = None,
+    owner_id: UUID | None = None,
+) -> EmailAddress:
     normalized = str(payload.address).lower()
     brand_id = payload.brand_id or _brand_id_for_contact(db, payload.contact_id)
+    # Resolve ownership from the related contact/brand before checking for a
+    # duplicate. A single address may legitimately exist in different groups.
+    related = db.get(Contact, payload.contact_id) if payload.contact_id else None
+    if related is None and brand_id is not None:
+        related = db.get(Brand, brand_id)
+    if related is not None:
+        organization_id = organization_id or related.organization_id
+        organization_unit_id = organization_unit_id or related.department_id
+        owner_id = owner_id or related.owner_id
     existing = db.scalar(
         select(EmailAddress).where(
-            EmailAddress.normalized_address == normalized, EmailAddress.deleted_at.is_(None)
+            EmailAddress.normalized_address == normalized,
+            EmailAddress.organization_id.is_(None)
+            if organization_id is None
+            else EmailAddress.organization_id == organization_id,
+            EmailAddress.department_id.is_(None)
+            if organization_unit_id is None
+            else EmailAddress.department_id == organization_unit_id,
+            EmailAddress.deleted_at.is_(None),
         )
     )
     if existing:
@@ -3129,6 +3461,9 @@ def create_email(db: Session, payload: EmailCreate, provider: str = "manual") ->
         status=EmailStatus.raw,
         pool=EmailPool.raw,
         provider=provider,
+        organization_id=organization_id,
+        department_id=organization_unit_id,
+        owner_id=owner_id,
     )
     db.add(email)
     db.flush()
@@ -3841,22 +4176,22 @@ def email_authenticity_detail(db: Session, email_id: UUID) -> dict:
     return result
 
 
-def dedup_check(db: Session) -> dict:
+def dedup_check(db: Session, organization_id=None) -> dict:
     duplicate_emails = db.execute(
         select(EmailAddress.normalized_address, func.count(EmailAddress.id))
-        .where(EmailAddress.deleted_at.is_(None))
+        .where(EmailAddress.deleted_at.is_(None), EmailAddress.organization_id == organization_id)
         .group_by(EmailAddress.normalized_address)
         .having(func.count(EmailAddress.id) > 1)
     ).all()
     duplicate_brands = db.execute(
         select(Brand.normalized_name, func.count(Brand.id))
-        .where(Brand.deleted_at.is_(None))
+        .where(Brand.deleted_at.is_(None), Brand.organization_id == organization_id)
         .group_by(Brand.normalized_name)
         .having(func.count(Brand.id) > 1)
     ).all()
     duplicate_contacts = db.execute(
         select(Contact.full_name, func.count(Contact.id))
-        .where(Contact.deleted_at.is_(None))
+        .where(Contact.deleted_at.is_(None), Contact.organization_id == organization_id)
         .group_by(Contact.full_name)
         .having(func.count(Contact.id) > 1)
     ).all()
@@ -3876,6 +4211,7 @@ def dedup_check(db: Session) -> dict:
                             select(EmailAddress.id).where(
                                 EmailAddress.normalized_address == value,
                                 EmailAddress.deleted_at.is_(None),
+                                EmailAddress.organization_id == organization_id,
                             )
                         ).all()
                     ],
@@ -3890,7 +4226,8 @@ def dedup_check(db: Session) -> dict:
                         str(item)
                         for item in db.scalars(
                             select(Brand.id).where(
-                                Brand.normalized_name == value, Brand.deleted_at.is_(None)
+                                Brand.normalized_name == value, Brand.deleted_at.is_(None),
+                                Brand.organization_id == organization_id,
                             )
                         ).all()
                     ],
@@ -3905,7 +4242,8 @@ def dedup_check(db: Session) -> dict:
                         str(item)
                         for item in db.scalars(
                             select(Contact.id).where(
-                                Contact.full_name == value, Contact.deleted_at.is_(None)
+                                Contact.full_name == value, Contact.deleted_at.is_(None),
+                                Contact.organization_id == organization_id,
                             )
                         ).all()
                     ],
@@ -3914,9 +4252,9 @@ def dedup_check(db: Session) -> dict:
             ],
         },
         "fuzzy": {
-            "brands": find_fuzzy_brands(db),
-            "contacts": find_fuzzy_contacts(db),
-            "emails": find_fuzzy_emails(db),
+            "brands": find_fuzzy_brands(db, organization_id=organization_id),
+            "contacts": find_fuzzy_contacts(db, organization_id=organization_id),
+            "emails": find_fuzzy_emails(db, organization_id=organization_id),
         },
     }
 
@@ -3985,6 +4323,8 @@ def import_rows(
     entity_type: str,
     rows: list[dict[str, str]],
     field_mapping: dict[str, str] | None = None,
+    *,
+    authorization=None,
 ) -> dict:
     if field_mapping:
         rows = [
@@ -4010,12 +4350,24 @@ def import_rows(
                         ),
                         source_type=SourceType.manual_import,
                         provider="file_import",
+                        organization_id=authorization.organization_id if authorization else None,
+                        organization_unit_id=(
+                            authorization.organization_unit_id if authorization else None
+                        ),
+                        owner_id=authorization.user_id if authorization else None,
                     )
                 elif entity_type == "contacts":
+                    brand_id = UUID(row["brand_id"]) if row.get("brand_id") else None
+                    if brand_id is not None and authorization is not None:
+                        from app.authz.policy import load_scoped_entity
+
+                        load_scoped_entity(
+                            db, Brand, brand_id, authorization, resource="brands"
+                        )
                     create_contact(
                         db,
                         ContactCreate(
-                            brand_id=UUID(row["brand_id"]) if row.get("brand_id") else None,
+                            brand_id=brand_id,
                             company_id=UUID(row["company_id"]) if row.get("company_id") else None,
                             first_name=row.get("first_name") or "",
                             last_name=row.get("last_name") or "",
@@ -4023,16 +4375,33 @@ def import_rows(
                             linkedin_url=row.get("linkedin_url") or None,
                         ),
                         provider="file_import",
+                        organization_id=authorization.organization_id if authorization else None,
+                        organization_unit_id=(
+                            authorization.organization_unit_id if authorization else None
+                        ),
+                        owner_id=authorization.user_id if authorization else None,
                     )
                 elif entity_type == "emails":
+                    contact_id = UUID(row["contact_id"]) if row.get("contact_id") else None
+                    if contact_id is not None and authorization is not None:
+                        from app.authz.policy import load_scoped_entity
+
+                        load_scoped_entity(
+                            db, Contact, contact_id, authorization, resource="contacts"
+                        )
                     create_email(
                         db,
                         EmailCreate(
-                            contact_id=UUID(row["contact_id"]) if row.get("contact_id") else None,
+                            contact_id=contact_id,
                             address=row.get("address") or row.get("email") or "",
                             type=row.get("type") or "personal",
                         ),
                         provider="file_import",
+                        organization_id=authorization.organization_id if authorization else None,
+                        organization_unit_id=(
+                            authorization.organization_unit_id if authorization else None
+                        ),
+                        owner_id=authorization.user_id if authorization else None,
                     )
                 else:
                     raise ValueError("entity_type must be brands, contacts, or emails")
@@ -4054,7 +4423,11 @@ def import_rows(
 
 
 def export_csv(
-    db: Session, entity_type: str, filters: dict[str, str | int | float | bool] | None = None
+    db: Session,
+    entity_type: str,
+    filters: dict[str, str | int | float | bool] | None = None,
+    *,
+    authorization=None,
 ) -> bytes:
     model = {
         "brands": Brand,
@@ -4066,6 +4439,12 @@ def export_csv(
     statement = select(model).order_by(model.created_at.desc())
     if hasattr(model, "deleted_at"):
         statement = statement.where(model.deleted_at.is_(None))
+    if authorization is not None and entity_type in {"brands", "contacts", "emails", "tasks"}:
+        from app.authz.scope import apply_scope
+
+        statement = apply_scope(statement, model, db, authorization, entity_type)
+    elif authorization is not None and entity_type == "audit_logs" and "admin:*" not in authorization.permissions:
+        statement = statement.where(AuditLog.organization_id == str(authorization.organization_id))
     for key, value in (filters or {}).items():
         column = getattr(model, key, None)
         if column is not None:
@@ -4152,8 +4531,25 @@ def export_selected_contacts_csv(db: Session, contact_ids: list[UUID]) -> tuple[
     return buffer.getvalue().encode("utf-8-sig"), len(items)
 
 
-def dashboard(db: Session) -> dict:
-    counts = current_counts(db)
+def dashboard(db: Session, *, authorization=None) -> dict:
+    if authorization is None:
+        counts = current_counts(db)
+    else:
+        from app.authz.scope import apply_scope
+
+        def scoped_count(model, resource: str, *filters) -> int:
+            statement = select(model.id).where(*filters)
+            statement = apply_scope(statement, model, db, authorization, resource)
+            return db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+
+        counts = {
+            "tasks": scoped_count(SearchTask, "tasks"),
+            "brands": scoped_count(Brand, "brands", Brand.deleted_at.is_(None)),
+            "contacts": scoped_count(Contact, "contacts", Contact.deleted_at.is_(None)),
+            "emails": scoped_count(
+                EmailAddress, "emails", EmailAddress.deleted_at.is_(None)
+            ),
+        }
     pending_candidates = (
         db.scalar(
             select(func.count())
@@ -4192,6 +4588,50 @@ def dashboard(db: Session) -> dict:
         .group_by(EmailAddress.pool)
     ).all()
     pool_counts = {pool: count for pool, count in pool_rows}
+    if authorization is not None and "admin:*" not in authorization.permissions:
+        valid_contacts = scoped_count(
+            Contact,
+            "contacts",
+            Contact.deleted_at.is_(None),
+            Contact.status == "valid",
+        )
+        valid_emails = scoped_count(
+            EmailAddress,
+            "emails",
+            EmailAddress.deleted_at.is_(None),
+            EmailAddress.pool == EmailPool.valid,
+        )
+        review_emails = scoped_count(
+            EmailAddress,
+            "emails",
+            EmailAddress.deleted_at.is_(None),
+            EmailAddress.pool == EmailPool.manual_review,
+        )
+        pool_counts = {}
+        for pool in EmailPool:
+            pool_counts[pool.value] = scoped_count(
+                EmailAddress,
+                "emails",
+                EmailAddress.deleted_at.is_(None),
+                EmailAddress.pool == pool,
+            )
+        accessible_tasks = apply_scope(
+            select(SearchTask.id), SearchTask, db, authorization, "tasks"
+        )
+        pending_candidates = (
+            db.scalar(
+                select(func.count(func.distinct(DiscoveryCandidateHit.candidate_id)))
+                .join(
+                    DiscoveryCandidate,
+                    DiscoveryCandidate.id == DiscoveryCandidateHit.candidate_id,
+                )
+                .where(
+                    DiscoveryCandidateHit.task_id.in_(accessible_tasks),
+                    DiscoveryCandidate.status == "pending",
+                )
+            )
+            or 0
+        )
     providers = []
     for provider in db.scalars(select(ProviderConfig).order_by(ProviderConfig.priority)).all():
         used = (
@@ -4210,12 +4650,14 @@ def dashboard(db: Session) -> dict:
                 "quota": provider.quota,
             }
         )
-    events = [
-        to_dict(item)
-        for item in db.scalars(
-            select(DomainEvent).order_by(DomainEvent.created_at.desc()).limit(8)
-        ).all()
-    ]
+    events = []
+    if authorization is None or "admin:*" in authorization.permissions:
+        events = [
+            to_dict(item)
+            for item in db.scalars(
+                select(DomainEvent).order_by(DomainEvent.created_at.desc()).limit(8)
+            ).all()
+        ]
     return {
         "metrics": {
             **counts,
@@ -4229,6 +4671,108 @@ def dashboard(db: Session) -> dict:
         "providers": providers,
         "events": events,
     }
+
+
+ASSIGNABLE_RESOURCE_MODELS = {
+    "tasks": SearchTask,
+    "brands": Brand,
+    "contacts": Contact,
+    "emails": EmailAddress,
+}
+
+
+def assign_business_data(
+    db: Session,
+    *,
+    resource: str,
+    entities: list,
+    target_unit: OrganizationUnit,
+    target_owner: User | None,
+    actor: User,
+    reason: str,
+) -> dict:
+    """Atomically move already-authorized business records to another unit."""
+    if resource not in ASSIGNABLE_RESOURCE_MODELS:
+        raise ValueError("Unsupported assignment resource")
+    if target_unit.status != "active":
+        raise ValueError("Target organization unit is disabled")
+    if target_unit.organization_id != actor.organization_id:
+        raise ValueError("Cross-organization assignment is not allowed")
+    if target_owner is not None and (
+        target_owner.deleted_at is not None
+        or target_owner.status != "active"
+        or target_owner.organization_id != target_unit.organization_id
+        or target_owner.organization_unit_id != target_unit.id
+    ):
+        raise ValueError("Target owner must be an active member of the target unit")
+
+    changes = []
+    for entity in entities:
+        before = {
+            "department_id": str(entity.department_id) if entity.department_id else None,
+            "owner_id": str(entity.owner_id) if entity.owner_id else None,
+        }
+        entity.department_id = target_unit.id
+        entity.owner_id = target_owner.id if target_owner else None
+        entity.updated_by = actor.id
+        after = {
+            "department_id": str(target_unit.id),
+            "owner_id": str(target_owner.id) if target_owner else None,
+            "assigned_by": str(actor.id),
+            "reason": reason,
+        }
+        audit(
+            db,
+            f"{resource.rstrip('s')}.assign",
+            resource.rstrip("s"),
+            str(entity.id),
+            before=before,
+            after=after,
+        )
+        emit(
+            db,
+            "data.assignment.changed",
+            {
+                "entity_id": str(entity.id),
+                "resource": resource,
+                **after,
+            },
+        )
+        changes.append({"id": str(entity.id), **after})
+    db.flush()
+    return {"resource": resource, "assigned": len(changes), "items": changes}
+
+
+def share_business_data(
+    db: Session, *, resource: str, entities: list, target_unit: OrganizationUnit,
+    actor: User, reason: str,
+) -> dict:
+    """Grant read access without altering organization, unit, or owner fields."""
+    if target_unit.status != "active" or target_unit.organization_id != actor.organization_id:
+        raise ValueError("Target organization unit is not available")
+    created = 0
+    for entity in entities:
+        if entity.organization_id != target_unit.organization_id:
+            raise ValueError("Cross-organization sharing is not allowed")
+        existing = db.scalar(select(DataShareGrant).where(
+            DataShareGrant.resource == resource,
+            DataShareGrant.entity_id == entity.id,
+            DataShareGrant.target_unit_id == target_unit.id,
+            DataShareGrant.revoked_at.is_(None),
+        ))
+        if existing is None:
+            db.add(DataShareGrant(
+                resource=resource, entity_id=entity.id,
+                organization_id=entity.organization_id,
+                source_unit_id=entity.department_id,
+                target_unit_id=target_unit.id, permission="read", reason=reason,
+                created_by=actor.id,
+            ))
+            created += 1
+        audit(db, f"{resource.rstrip('s')}.share", resource.rstrip('s'), str(entity.id),
+              after={"target_unit_id": str(target_unit.id), "reason": reason})
+    db.flush()
+    return {"resource": resource, "shared": created, "target_unit_id": str(target_unit.id)}
 
 
 def create_provider_config(db: Session, payload: ProviderConfigCreate) -> ProviderConfig:
@@ -5508,6 +6052,15 @@ def get_system_settings(db: Session) -> dict:
     }
 
 
+def get_task_defaults(db: Session) -> dict:
+    """Expose only safe task-creation defaults to task users."""
+    settings = get_system_settings(db)
+    return {
+        "target_titles": list(settings["title_dictionary"].get("p1") or []),
+        "contacts_limit_per_brand": settings["task_rules"].get("default_contact_limit", 5),
+    }
+
+
 def _stored_ai_settings(stored: dict) -> dict:
     return decrypt_provider_config({"ai": stored.get("ai", {})}).get("ai", {})
 
@@ -5603,20 +6156,31 @@ def plan_ai_task(db: Session, payload: AITaskPlanRequest) -> dict:
 
 
 def list_roles(db: Session, page: int, page_size: int, *, actor: User) -> dict:
-    from app.core.security import can_assign_role
+    from app.core.security import can_assign_role, get_user_permissions
 
-    roles = list(db.scalars(select(Role).order_by(Role.created_at.desc())).all())
+    statement = select(Role)
+    if "admin:*" not in get_user_permissions(db, actor):
+        statement = statement.where(Role.organization_id == actor.organization_id)
+    roles = list(db.scalars(statement.order_by(Role.created_at.desc())).all())
     roles = [role for role in roles if can_assign_role(db, actor, role.id)]
     total = len(roles)
     items = [to_dict(role) for role in roles[(page - 1) * page_size:page * page_size]]
     return page_result(total, page, page_size, items)
 
 
-def create_role(db: Session, payload: RoleCreate) -> Role:
-    existing = db.scalar(select(Role).where(Role.name == payload.name.strip().lower()))
+def create_role(db: Session, payload: RoleCreate, *, organization_id=None) -> Role:
+    normalized_name = payload.name.strip().lower()
+    existing = db.scalar(
+        select(Role).where(Role.name == normalized_name, Role.organization_id == organization_id)
+    )
     if existing:
         raise ValueError("Role already exists")
-    role = Role(name=payload.name.strip().lower(), permissions=payload.permissions)
+    role = Role(
+        name=normalized_name,
+        permissions=payload.permissions,
+        data_scopes=payload.data_scopes,
+        organization_id=organization_id,
+    )
     db.add(role)
     db.flush()
     audit(
@@ -5630,15 +6194,23 @@ def create_role(db: Session, payload: RoleCreate) -> Role:
 
 
 def update_role(db: Session, role: Role, payload: RoleUpdate) -> Role:
-    before = {"permissions": role.permissions}
+    before = {"permissions": role.permissions, "data_scopes": role.data_scopes, "status": role.status}
     role.permissions = payload.permissions
+    role.data_scopes = payload.data_scopes
+    if payload.status is not None:
+        role.status = payload.status
+    role.permission_version = 1
     audit(
         db,
         "role.update",
         "role",
         str(role.id),
         before=before,
-        after={"permissions": role.permissions},
+        after={
+            "permissions": role.permissions,
+            "data_scopes": role.data_scopes,
+            "status": role.status,
+        },
     )
     return role
 
@@ -5681,6 +6253,7 @@ def create_user(
         password_hash=hash_password(payload.password),
         role_id=payload.role_id,
         department_id=payload.department_id,
+        organization_unit_id=payload.organization_unit_id,
         organization_id=organization_id,
         status=payload.status,
     )

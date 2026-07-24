@@ -1,3 +1,6 @@
+import uuid
+from datetime import datetime
+
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, cast, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,14 +19,77 @@ class Organization(UUIDMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(40), default="active")
 
 
+class OrganizationUnit(UUIDMixin, TimestampMixin, Base):
+    """Hierarchical organizational unit (department, team, division, company)."""
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization.id"), nullable=False, index=True
+    )
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_unit.id"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    code: Mapped[str] = mapped_column(String(120))
+    unit_type: Mapped[str] = mapped_column(String(40), default="department")
+    manager_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    path: Mapped[str] = mapped_column(String(1000), default="/", index=True)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "parent_id", "name", name="uq_org_unit_org_parent_name"),
+        UniqueConstraint("organization_id", "code", name="uq_org_unit_org_code"),
+    )
+
+
 class Role(UUIDMixin, TimestampMixin, Base):
-    name: Mapped[str] = mapped_column(String(80), unique=True)
+    name: Mapped[str] = mapped_column(String(80))
     permissions: Mapped[dict] = mapped_column(JSON, default=dict)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization.id"), nullable=True, index=True
+    )
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(40), default="active")
+    permission_version: Mapped[int] = mapped_column(Integer, default=1)
+    data_scopes: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_role_org_name"),
+    )
+
+
+class DataShareGrant(UUIDMixin, TimestampMixin, Base):
+    """A revocable, read-only cross-unit grant that never changes ownership."""
+
+    resource: Mapped[str] = mapped_column(String(40), index=True)
+    entity_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization.id"), nullable=False, index=True
+    )
+    source_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_unit.id"), nullable=True, index=True
+    )
+    target_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organization_unit.id"), nullable=False, index=True
+    )
+    permission: Mapped[str] = mapped_column(String(20), default="read")
+    reason: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_share_grant_active_lookup", "resource", "entity_id", "target_unit_id", "revoked_at"),
+    )
 
 
 class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     organization_id: Mapped[str | None] = mapped_column(ForeignKey("organization.id"), nullable=True)
     department_id: Mapped[str | None] = mapped_column(nullable=True)
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_unit.id"), nullable=True, index=True
+    )
     role_id: Mapped[str | None] = mapped_column(ForeignKey("role.id"), nullable=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
@@ -346,13 +412,117 @@ class Blacklist(UUIDMixin, TimestampMixin, Base):
 
 
 class AuditLog(UUIDMixin, TimestampMixin, Base):
-    actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(120), index=True)
     entity_type: Mapped[str] = mapped_column(String(60), index=True)
     entity_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     before: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     after: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
+
+
+# Outreach is deliberately kept separate from discovery data.  It references
+# verified emails and snapshots content/configuration at scheduling time.
+class SendingAccount(UUIDMixin, TimestampMixin, OwnershipMixin, Base):
+    name: Mapped[str] = mapped_column(String(120))
+    provider: Mapped[str] = mapped_column(String(40), default="disabled")
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("vendor_credential.id"), nullable=True)
+    from_email: Mapped[str] = mapped_column(String(255))
+    from_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="disabled", index=True)
+    daily_limit: Mapped[int] = mapped_column(Integer, default=0)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class EmailTemplate(UUIDMixin, TimestampMixin, OwnershipMixin, SoftDeleteMixin, Base):
+    name: Mapped[str] = mapped_column(String(160))
+    subject: Mapped[str] = mapped_column(String(500))
+    body_html: Mapped[str] = mapped_column(Text)
+    body_text: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default="draft", index=True)
+    variable_defaults: Mapped[dict] = mapped_column(JSON, default=dict)
+    missing_variable_policy: Mapped[str] = mapped_column(String(20), default="block")
+
+
+class OutreachCampaign(UUIDMixin, TimestampMixin, OwnershipMixin, Base):
+    name: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(30), default="draft", index=True)
+    sending_account_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("sending_account.id"), nullable=True)
+    configuration_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+
+
+class OutreachStep(UUIDMixin, TimestampMixin, Base):
+    campaign_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outreach_campaign.id"), index=True)
+    sequence_order: Mapped[int] = mapped_column(Integer)
+    delay_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    template_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("email_template.id"))
+    template_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    __table_args__ = (UniqueConstraint("campaign_id", "sequence_order", name="uq_outreach_step_order"),)
+
+
+class OutreachRecipient(UUIDMixin, TimestampMixin, OwnershipMixin, Base):
+    campaign_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outreach_campaign.id"), index=True)
+    email_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("email_address.id"), index=True)
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("contact.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    __table_args__ = (UniqueConstraint("campaign_id", "email_id", name="uq_outreach_campaign_email"),)
+
+
+class OutreachMessage(UUIDMixin, TimestampMixin, Base):
+    recipient_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outreach_recipient.id"), index=True)
+    step_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outreach_step.id"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    subject_snapshot: Mapped[str] = mapped_column(String(500))
+    body_text_snapshot: Mapped[str] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    __table_args__ = (UniqueConstraint("recipient_id", "step_id", name="uq_outreach_recipient_step"),)
+
+
+class OutreachEvent(UUIDMixin, TimestampMixin, Base):
+    message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outreach_message.id"), nullable=True, index=True)
+    email_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("email_address.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class DataImportBatch(UUIDMixin, TimestampMixin, Base):
+    """Durable staging metadata; raw rows live in DataImportRow until applied."""
+    source_type: Mapped[str] = mapped_column(String(40))
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    status: Mapped[str] = mapped_column(String(40), default="uploaded", index=True)
+    organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organization.id"), index=True)
+    organization_unit_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organization_unit.id"), nullable=True)
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    rollback_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DataImportRow(UUIDMixin, TimestampMixin, Base):
+    batch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("data_import_batch.id"), index=True)
+    row_number: Mapped[int] = mapped_column(Integer)
+    entity_type: Mapped[str] = mapped_column(String(30))
+    raw_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    match_entity_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    conflict: Mapped[dict] = mapped_column(JSON, default=dict)
+    applied_entity_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    __table_args__ = (UniqueConstraint("batch_id", "row_number", name="uq_data_import_row_number"),)
 
 
 class ProviderConfig(UUIDMixin, TimestampMixin, Base):
@@ -683,6 +853,12 @@ class BatchImport(UUIDMixin, TimestampMixin, Base):
 
     organization_id: Mapped[str | None] = mapped_column(
         ForeignKey("organization.id"), nullable=True, index=True
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organization_unit.id"), nullable=True, index=True
+    )
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("user.id"), nullable=True, index=True
     )
     created_by: Mapped[str | None] = mapped_column(ForeignKey("user.id"), nullable=True)
     filename: Mapped[str] = mapped_column(String(255))

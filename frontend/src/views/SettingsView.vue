@@ -79,23 +79,108 @@
       </div>
     </el-tab-pane>
 
+    <el-tab-pane v-if="canReadOrgUnits" label="组织与权限" name="org">
+      <el-row :gutter="16">
+        <el-col :xs="24" :md="10">
+          <div class="panel">
+            <div class="panel-heading">
+              <div><h3>组织架构</h3><p class="section-help">管理公司内部组织单元树</p></div>
+              <div v-if="hasOrgWrite" style="display:flex;gap:6px">
+                <el-button size="small" @click="openCreateOrgUnit('root')">新增根级</el-button>
+                <el-button size="small" type="primary" @click="openCreateOrgUnit('child')">新增下级</el-button>
+              </div>
+            </div>
+            <div v-if="orgTreeLoading" style="padding: 40px; text-align: center"><el-icon class="is-loading"><span>⋯</span></el-icon></div>
+            <el-tree
+              v-else-if="orgTree.length"
+              :data="orgTree"
+              node-key="id"
+              default-expand-all
+              highlight-current
+              :props="{ label: 'name', children: 'children' }"
+              @node-click="selectOrgUnit"
+            >
+              <template #default="{ node, data }">
+                <span style="flex:1;display:flex;justify-content:space-between;align-items:center">
+                  <span>{{ data.name }} <el-tag size="small" :type="data.status==='active'?'success':'info'">{{ data.status==='active'?'启用':'已停用' }}</el-tag></span>
+                </span>
+              </template>
+            </el-tree>
+            <el-empty v-else description="暂无组织架构" />
+          </div>
+        </el-col>
+        <el-col :xs="24" :md="14">
+          <div v-if="selectedOrgUnit" class="panel">
+            <div class="panel-heading">
+              <div><h3>{{ selectedOrgUnit.name }}</h3><p class="section-help">组织单元详情</p></div>
+              <div style="display:flex;gap:6px">
+                <el-button v-if="hasOrgWrite" size="small" type="primary" @click="openCreateOrgUnit('child')">新增下级</el-button>
+                <el-button v-if="hasOrgWrite" size="small" @click="openCreateOrgUnit('sibling')">新增同级</el-button>
+                <el-button v-if="hasOrgWrite" size="small" @click="editOrgUnit">编辑</el-button>
+                <el-button v-if="hasOrgMove" size="small" @click="orgMoveVisible = true">移动</el-button>
+                <el-button v-if="hasOrgDisable" size="small" @click="toggleOrgUnitStatus">{{ selectedOrgUnit.status === 'active' ? '停用' : '启用' }}</el-button>
+                <el-button v-if="hasOrgDelete" size="small" type="danger" @click="deleteOrgUnit">删除</el-button>
+              </div>
+            </div>
+            <el-descriptions :column="2" border size="small">
+              <el-descriptions-item label="编码">{{ selectedOrgUnit.code }}</el-descriptions-item>
+              <el-descriptions-item label="类型">{{ unitTypeLabel(selectedOrgUnit.unit_type) }}</el-descriptions-item>
+              <el-descriptions-item label="层级">{{ selectedOrgUnit.depth }}</el-descriptions-item>
+              <el-descriptions-item label="状态">{{ selectedOrgUnit.status === 'active' ? '启用' : '已停用' }}</el-descriptions-item>
+              <el-descriptions-item label="主管">{{ selectedOrgUnit.manager_user_id || '未设置' }}</el-descriptions-item>
+              <el-descriptions-item label="路径">{{ selectedOrgUnit.path }}</el-descriptions-item>
+            </el-descriptions>
+          </div>
+          <div v-else class="panel"><el-empty description="选择左侧组织单元查看详情" /></div>
+        </el-col>
+      </el-row>
+      <!-- Org unit create dialog -->
+      <el-dialog v-model="orgCreateVisible" title="新增组织单元" width="460px" destroy-on-close>
+        <el-form label-width="80px" :model="orgForm">
+          <el-form-item label="名称" required><el-input v-model="orgForm.name" maxlength="255" /></el-form-item>
+          <el-form-item label="编码" required><el-input v-model="orgForm.code" maxlength="120" /></el-form-item>
+          <el-form-item label="类型"><el-select v-model="orgForm.unit_type"><el-option label="公司" value="company" /><el-option label="部门" value="department" /><el-option label="团队" value="team" /></el-select></el-form-item>
+          <el-form-item v-if="orgDialogMode === 'create'" label="父节点">
+            <el-tree-select
+              v-model="orgForm.parent_id"
+              :data="orgTree"
+              node-key="id"
+              :props="{ label: 'name', children: 'children' }"
+              check-strictly
+              clearable
+              placeholder="留空则创建为根级组织"
+              style="width:100%"
+            />
+          </el-form-item>
+        </el-form>
+        <template #footer><el-button @click="orgCreateVisible=false">取消</el-button><el-button type="primary" :loading="orgSaving" @click="saveOrgUnit">创建</el-button></template>
+      </el-dialog>
+      <!-- Org move dialog -->
+      <el-dialog v-model="orgMoveVisible" title="移动组织单元" width="460px">
+        <p>将 <strong>{{ selectedOrgUnit?.name }}</strong> 移动到新的父节点下</p>
+        <el-tree :data="orgTree" node-key="id" :props="{ label: 'name' }" highlight-current @node-click="(data:any) => moveTargetId = data.id" />
+        <el-alert v-if="moveTargetId === selectedOrgUnit?.id" type="error" title="不能移动到自身" :closable="false" />
+        <template #footer><el-button @click="orgMoveVisible=false">取消</el-button><el-button type="primary" @click="moveOrgUnit" :disabled="!moveTargetId || moveTargetId === selectedOrgUnit?.id">移动</el-button></template>
+      </el-dialog>
+    </el-tab-pane>
+
     <el-tab-pane v-if="canReadUsers || canReadRoles" label="用户与角色" name="access">
       <el-row :gutter="16">
         <el-col v-if="canReadRoles" :xs="24" :lg="canReadUsers ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>角色与权限</h3><el-button v-if="canWriteRoles" @click="openRole()">新增角色</el-button></div>
+            <div class="panel-heading"><h3>角色与权限</h3><el-button v-if="canCreateRoles" @click="openRole()">新增角色</el-button></div>
             <EntityTable ref="roleTable" endpoint="/roles" :columns="roleColumns">
               <template #cell-permissions="{ value }"><span>{{ permissionSummary(value) }}</span></template>
-              <template #actions="{ row }"><el-button v-if="canWriteRoles" size="small" @click="openRole(row)">编辑</el-button></template>
+              <template #actions="{ row }"><el-button v-if="canUpdateRoles" size="small" @click="openRole(row)">编辑</el-button></template>
             </EntityTable>
           </div>
         </el-col>
         <el-col v-if="canReadUsers" :xs="24" :lg="canReadRoles ? 12 : 24">
           <div class="panel">
-            <div class="panel-heading"><h3>用户</h3><el-button v-if="canWriteUsers" @click="openUser()">新增用户</el-button></div>
+            <div class="panel-heading"><h3>用户</h3><el-button v-if="canCreateUsers" @click="openUser()">新增用户</el-button></div>
             <EntityTable ref="userTable" endpoint="/users" :columns="userColumns">
               <template #cell-status="{ value }"><el-tag :type="value === 'active' ? 'success' : 'info'">{{ value === 'active' ? '启用' : '停用' }}</el-tag></template>
-              <template #actions="{ row }"><el-button v-if="canWriteUsers" size="small" @click="openUser(row)">编辑</el-button></template>
+              <template #actions="{ row }"><el-button v-if="canUpdateUsers" size="small" @click="openUser(row)">编辑</el-button></template>
             </EntityTable>
           </div>
         </el-col>
@@ -237,12 +322,12 @@
   </el-dialog>
 
   <el-dialog v-model="roleVisible" :title="roleForm.id ? '编辑角色' : '新增角色'" width="min(680px, 94vw)">
-    <el-form label-position="top"><el-form-item label="角色名称"><el-input v-model="roleForm.name" :disabled="Boolean(roleForm.id)" placeholder="例如：销售主管" /></el-form-item><el-form-item label="可使用的功能"><div class="permission-list"><label v-for="item in permissionOptions" :key="item.resource" class="permission-row"><span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span><el-checkbox-group v-model="roleForm.permissions[item.resource]"><el-checkbox v-for="action in item.actions" :key="action.value" :label="action.value">{{ action.label }}</el-checkbox></el-checkbox-group></label></div></el-form-item></el-form>
+    <el-form label-position="top"><el-form-item label="角色名称"><el-input v-model="roleForm.name" :disabled="Boolean(roleForm.id)" placeholder="例如：销售主管" /></el-form-item><el-form-item label="可使用的功能"><div class="permission-list"><label v-for="item in permissionOptions" :key="item.resource" class="permission-row"><span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span><div><el-checkbox-group v-model="roleForm.permissions[item.resource]"><el-checkbox v-for="action in item.actions" :key="action.value" :label="action.value">{{ action.label }}</el-checkbox></el-checkbox-group><el-select v-if="item.dataScoped" v-model="roleForm.data_scopes[item.resource]" size="small" style="width:180px;margin-top:8px"><el-option v-for="scope in dataScopeOptions" :key="scope.value" :label="scope.label" :value="scope.value" /></el-select></div></label></div></el-form-item></el-form>
     <template #footer><el-button @click="roleVisible = false">取消</el-button><el-button type="primary" @click="saveRole">保存</el-button></template>
   </el-dialog>
 
   <el-dialog v-model="userVisible" :title="userForm.id ? '编辑用户' : '新增用户'" width="520px">
-    <el-form label-width="110px"><el-form-item label="姓名"><el-input v-model="userForm.name" /></el-form-item><el-form-item label="邮箱"><el-input v-model="userForm.email" :disabled="Boolean(userForm.id)" /></el-form-item><el-form-item :label="userForm.id ? '重置密码' : '密码'"><el-input v-model="userForm.password" type="password" show-password /></el-form-item><el-form-item label="角色"><el-select v-model="userForm.role_id" clearable style="width: 100%"><el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" /></el-select></el-form-item><el-form-item label="状态"><el-select v-model="userForm.status" style="width: 100%"><el-option label="启用" value="active" /><el-option label="停用" value="disabled" /></el-select></el-form-item></el-form>
+    <el-form label-width="110px"><el-form-item label="姓名"><el-input v-model="userForm.name" /></el-form-item><el-form-item label="邮箱"><el-input v-model="userForm.email" :disabled="Boolean(userForm.id)" /></el-form-item><el-form-item :label="userForm.id ? '重置密码' : '密码'"><el-input v-model="userForm.password" type="password" show-password /></el-form-item><el-form-item label="组织单元"><el-tree-select v-model="userForm.organization_unit_id" :data="orgTree" node-key="id" :props="{ label: 'name', children: 'children' }" check-strictly clearable style="width:100%" /></el-form-item><el-form-item label="角色"><el-select v-model="userForm.role_id" clearable style="width: 100%"><el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" /></el-select></el-form-item><el-form-item label="状态"><el-select v-model="userForm.status" style="width: 100%"><el-option label="启用" value="active" /><el-option label="停用" value="disabled" /></el-select></el-form-item></el-form>
     <template #footer><el-button @click="userVisible = false">取消</el-button><el-button type="primary" @click="saveUser">保存</el-button></template>
   </el-dialog>
 
@@ -260,18 +345,25 @@ import { useAuth } from '../stores/auth'
 
 const auth = useAuth()
 const canReadSettings = computed(() => auth.hasPermission('settings:read'))
-const canWriteSettings = computed(() => auth.hasPermission('settings:write'))
+const canWriteSettings = computed(() => auth.hasPermission('settings:update'))
 const canReadProviders = computed(() => auth.hasPermission('providers:read'))
 const canReadRoles = computed(() => auth.hasPermission('roles:read'))
-const canWriteRoles = computed(() => auth.hasPermission('roles:write'))
+const canCreateRoles = computed(() => auth.hasPermission('roles:create'))
+const canUpdateRoles = computed(() => auth.hasPermission('roles:update'))
 const canReadUsers = computed(() => auth.hasPermission('users:read'))
-const canWriteUsers = computed(() => auth.hasPermission('users:write'))
+const canCreateUsers = computed(() => auth.hasPermission('users:create'))
+const canUpdateUsers = computed(() => auth.hasPermission('users:update'))
 const canReadTags = computed(() => auth.hasPermission('tags:read'))
-const canWriteTags = computed(() => auth.hasPermission('tags:write'))
+const canWriteTags = computed(() => auth.hasPermission('tags:create'))
 const canReadCustomFields = computed(() => auth.hasPermission('custom_fields:read'))
-const canWriteCustomFields = computed(() => auth.hasPermission('custom_fields:write'))
+const canWriteCustomFields = computed(() => auth.hasPermission('custom_fields:create'))
 const canReadAudit = computed(() => auth.hasPermission('audit:read'))
-const firstAllowedTab = () => canReadSettings.value ? 'rules' : canReadProviders.value ? 'providers' : (canReadUsers.value || canReadRoles.value) ? 'access' : (canReadTags.value || canReadCustomFields.value) ? 'metadata' : 'audit'
+const canReadOrgUnits = computed(() => auth.hasPermission('organization_units:read'))
+const hasOrgWrite = computed(() => auth.hasPermission('organization_units:create'))
+const hasOrgMove = computed(() => auth.hasPermission('organization_units:move'))
+const hasOrgDisable = computed(() => auth.hasAnyPermission(['organization_units:disable', 'organization_units:enable']))
+const hasOrgDelete = computed(() => auth.hasPermission('organization_units:delete'))
+const firstAllowedTab = () => canReadSettings.value ? 'rules' : canReadOrgUnits.value ? 'org' : canReadProviders.value ? 'providers' : (canReadUsers.value || canReadRoles.value) ? 'access' : (canReadTags.value || canReadCustomFields.value) ? 'metadata' : 'audit'
 const activeTab = ref(firstAllowedTab())
 const providerTable = ref<InstanceType<typeof EntityTable>>()
 const roleTable = ref<InstanceType<typeof EntityTable>>()
@@ -296,31 +388,154 @@ const vendorKeys = reactive<Record<string, string>>({})
 const vendorsLoading = ref(false)
 const systemRules = reactive({ p1: '', p2: '', p3: '', excluded: '', validScore: 70, riskyScore: 40, maxAttempts: 3, retryDelay: 60, maxConcurrency: 4, defaultContactLimit: 5 })
 const aiSettings = reactive({ enabled: false, baseUrl: 'https://api.openai.com/v1', modelName: 'gpt-4o-mini', requestTimeoutSeconds: 60, apiKey: '' })
-const roleForm = reactive<{ id: string; name: string; permissions: Record<string, string[]> }>({ id: '', name: '', permissions: {} })
-const userForm = reactive({ id: '', name: '', email: '', password: '', role_id: '', status: 'active' })
+const roleForm = reactive<{ id: string; name: string; permissions: Record<string, string[]>; data_scopes: Record<string, string> }>({ id: '', name: '', permissions: {}, data_scopes: {} })
+
+// ── Organization unit state ──────────────────────────────────────────────
+const orgTree = ref<any[]>([])
+const orgTreeLoading = ref(false)
+const selectedOrgUnit = ref<any>(null)
+const orgCreateVisible = ref(false)
+const orgMoveVisible = ref(false)
+const orgSaving = ref(false)
+const orgDialogMode = ref<'create' | 'edit'>('create')
+const moveTargetId = ref<string | null>(null)
+const orgForm = reactive({ name: '', code: '', unit_type: 'department', parent_id: null as string | null })
+
+async function loadOrgTree() {
+  orgTreeLoading.value = true
+  try {
+    const { data } = await api.get('/organization-units/tree')
+    orgTree.value = Array.isArray(data) ? data : []
+  } catch { orgTree.value = [] }
+  finally { orgTreeLoading.value = false }
+}
+
+function selectOrgUnit(data: any) {
+  selectedOrgUnit.value = data
+}
+
+function openCreateOrgUnit(placement: 'root' | 'child' | 'sibling' = 'child') {
+  if (placement !== 'root' && !selectedOrgUnit.value) {
+    alert('请先选择一个组织单元，再新增下级或同级组织。')
+    return
+  }
+  orgDialogMode.value = 'create'
+  const parentId = placement === 'child'
+    ? selectedOrgUnit.value?.id || null
+    : placement === 'sibling'
+      ? selectedOrgUnit.value?.parent_id || null
+      : null
+  Object.assign(orgForm, { name: '', code: '', unit_type: 'department', parent_id: parentId })
+  orgCreateVisible.value = true
+}
+
+function editOrgUnit() {
+  if (!selectedOrgUnit.value) return
+  const unit = selectedOrgUnit.value
+  orgForm.name = unit.name
+  orgForm.code = unit.code
+  orgForm.unit_type = unit.unit_type
+  orgForm.parent_id = unit.parent_id || null
+  orgDialogMode.value = 'edit'
+  orgCreateVisible.value = true
+}
+
+async function saveOrgUnit() {
+  if (!orgForm.name.trim() || !orgForm.code.trim()) return
+  orgSaving.value = true
+  try {
+    if (orgDialogMode.value === 'edit' && selectedOrgUnit.value) {
+      await api.patch(`/organization-units/${selectedOrgUnit.value.id}`, {
+        name: orgForm.name.trim(),
+        code: orgForm.code.trim(),
+        unit_type: orgForm.unit_type,
+      })
+    } else {
+      await api.post('/organization-units', {
+        name: orgForm.name.trim(),
+        code: orgForm.code.trim(),
+        unit_type: orgForm.unit_type,
+        parent_id: orgForm.parent_id,
+      })
+    }
+    orgCreateVisible.value = false
+    orgForm.name = ''; orgForm.code = ''; orgForm.parent_id = null
+    await loadOrgTree()
+  } catch (error: any) {
+    alert(error.response?.data?.detail || error.message || '保存失败')
+  } finally { orgSaving.value = false }
+}
+
+async function moveOrgUnit() {
+  if (!selectedOrgUnit.value || !moveTargetId.value) return
+  try {
+    await api.post(`/organization-units/${selectedOrgUnit.value.id}/move`, { parent_id: moveTargetId.value })
+    orgMoveVisible.value = false
+    moveTargetId.value = null
+    await loadOrgTree()
+  } catch (error: any) {
+    alert(error.response?.data?.detail || error.message || '移动失败')
+  }
+}
+
+async function toggleOrgUnitStatus() {
+  if (!selectedOrgUnit.value) return
+  try {
+    if (selectedOrgUnit.value.status === 'active') {
+      await api.post(`/organization-units/${selectedOrgUnit.value.id}/disable`)
+    } else {
+      await api.post(`/organization-units/${selectedOrgUnit.value.id}/enable`)
+    }
+    selectedOrgUnit.value.status = selectedOrgUnit.value.status === 'active' ? 'disabled' : 'active'
+  } catch (error: any) {
+    alert(error.response?.data?.detail || error.message || '操作失败')
+  }
+}
+
+async function deleteOrgUnit() {
+  if (!selectedOrgUnit.value || !confirm('确认删除此组织单元？此操作不可撤销。')) return
+  try {
+    await api.delete(`/organization-units/${selectedOrgUnit.value.id}`)
+    selectedOrgUnit.value = null
+    await loadOrgTree()
+  } catch (error: any) {
+    const detail = error.response?.data?.detail
+    if (typeof detail === 'object' && detail.blockers) {
+      alert(`无法删除：存在 ${detail.blockers.map((b:any) => `${b.count} 个${b.type==='children'?'子节点':b.type==='users'?'用户':'业务数据'}`).join('、')}`)
+    } else {
+      alert(detail?.message || detail || '删除失败')
+    }
+  }
+}
+
+function unitTypeLabel(t: string) {
+  return ({ company: '公司', division: '事业部', department: '部门', team: '团队' } as Record<string, string>)[t] || t
+}
+const userForm = reactive({ id: '', name: '', email: '', password: '', role_id: '', organization_unit_id: '', status: 'active' })
 const tagForm = reactive({ name: '', module: 'brands' })
 const customFieldForm = reactive({ name: '', module: 'brands', type: 'text', is_required: false, is_searchable: true, show_in_list: true })
 
 const moduleOptions = [{ label: '品牌', value: 'brands' }, { label: '联系人', value: 'contacts' }, { label: '邮箱', value: 'emails' }]
 const fieldTypes = ['text', 'number', 'date', 'single_select', 'multi_select', 'boolean', 'url', 'email', 'phone']
 const fieldTypeLabels: Record<string, string> = { text: '文本', number: '数字', date: '日期', single_select: '单选', multi_select: '多选', boolean: '是/否', url: '网址', email: '邮箱', phone: '电话' }
+const actionLabels: Record<string, string> = { read: '查看', create: '创建', update: '编辑', start: '启动', pause: '暂停', resume: '继续', cancel: '取消', retry: '重试', delete: '删除', export: '导出', review: '审核', archive: '归档', promote: '转为正式品牌', bulk_delete: '批量删除', verify: '验证', bulk_verify: '批量验证', preview: '预览', execute: '执行', merge: '合并', assign: '分配', enable: '启用', disable: '停用', test: '测试', read_usage: '查看用量', move: '移动', assign_manager: '设置主管', reset_password: '重置密码', move_unit: '调整部门', assign_role: '分配角色', clone: '克隆' }
+const permissionDefinitions: Record<string, { label: string; operations: string[]; dataScoped?: boolean }> = {
+  tasks: { label: '任务', operations: ['read','create','update','start','pause','resume','cancel','retry','delete','export','assign'], dataScoped: true },
+  brands: { label: '品牌', operations: ['read','create','update','review','archive','delete','export','promote','assign'], dataScoped: true },
+  contacts: { label: '联系人', operations: ['read','create','update','delete','bulk_delete','export','assign'], dataScoped: true },
+  emails: { label: '邮箱', operations: ['read','create','update','verify','bulk_verify','delete','export','assign'], dataScoped: true },
+  imports: { label: '导入', operations: ['read','preview','execute','retry','cancel'], dataScoped: true },
+  dedup: { label: '去重', operations: ['read','execute','merge'] }, blacklist: { label: '黑名单', operations: ['read','create','update','delete'] },
+  tags: { label: '标签', operations: ['read','create','update','delete','assign'] }, custom_fields: { label: '自定义字段', operations: ['read','create','update','delete','assign'] },
+  providers: { label: '数据服务', operations: ['read','create','update','enable','disable','test','delete','read_usage'] }, settings: { label: '系统设置', operations: ['read','update'] },
+  organization_units: { label: '组织单元', operations: ['read','create','update','move','enable','disable','delete','assign_manager'] },
+  users: { label: '用户', operations: ['read','create','update','enable','disable','reset_password','move_unit','assign_role'] }, roles: { label: '角色', operations: ['read','create','update','clone','delete','assign'] },
+  audit: { label: '审计', operations: ['read','export'] }, exports: { label: '统一导出', operations: ['execute'] },
+}
 const permissionOptions = [
-  { resource: 'brands', label: '品牌', description: '查看、编辑和导出品牌资料', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '导出', value: 'export' }] },
-  { resource: 'contacts', label: '联系人', description: '查看、编辑和导出联系人', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '导出', value: 'export' }] },
-  { resource: 'emails', label: '邮箱', description: '管理、验证和导出邮箱', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '验证', value: 'verify' }, { label: '导出', value: 'export' }] },
-  { resource: 'tasks', label: '任务', description: '创建、修改和运行搜索任务', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }, { label: '运行', value: 'execute' }] },
-  { resource: 'providers', label: '数据服务', description: '管理第三方数据源和密钥', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'settings', label: '系统设置', description: '查看或修改全局业务规则', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'users', label: '用户', description: '管理系统登录用户', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'roles', label: '角色', description: '管理角色及其权限', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'audit', label: '审计日志', description: '查看系统操作记录', actions: [{ label: '查看', value: 'read' }] },
-  { resource: 'tags', label: '标签', description: '管理品牌、联系人和邮箱标签', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'custom_fields', label: '自定义字段', description: '管理业务对象的扩展字段', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
-  { resource: 'import', label: '导入', description: '导入业务数据', actions: [{ label: '执行', value: 'execute' }] },
-  { resource: 'export', label: '统一导出', description: '执行系统级数据导出', actions: [{ label: '执行', value: 'execute' }] },
-  { resource: 'dedup', label: '数据去重', description: '执行重复数据清理', actions: [{ label: '执行', value: 'execute' }] },
-  { resource: 'blacklist', label: '黑名单', description: '查看和维护黑名单', actions: [{ label: '查看', value: 'read' }, { label: '编辑', value: 'write' }] },
+  ...Object.entries(permissionDefinitions).map(([resource, definition]) => ({ resource, label: definition.label, description: definition.dataScoped ? '操作权限和可见数据范围分别控制' : '按具体操作授权', dataScoped: Boolean(definition.dataScoped), actions: definition.operations.map((value) => ({ value, label: actionLabels[value] || value })) })),
 ]
+const dataScopeOptions = [{ label: '仅本人', value: 'self' }, { label: '本部门', value: 'unit' }, { label: '本部门及下级', value: 'unit_and_children' }, { label: '整个组织', value: 'organization' }]
 const adapterOptions = [{ label: 'HTTP', value: 'http' }, { label: '内置', value: 'builtin' }]
 const providerTypes = [{ label: '企业/品牌搜索', value: 'company_search' }, { label: '联系人搜索', value: 'contact_search' }, { label: '品牌域名邮箱搜索', value: 'brand_email_search' }, { label: '联系人邮箱查找', value: 'email_finder' }, { label: '邮箱验证', value: 'email_verifier' }, { label: '通知', value: 'notification' }]
 const providerColumns: TableColumn[] = [{ key: 'provider', label: '名称', width: 170 }, { key: 'type', label: '类型', width: 150 }, { key: 'enabled', label: '启用', width: 90 }, { key: 'priority', label: '优先级', width: 90 }, { key: 'config', label: '连接配置', width: 360 }]
@@ -478,10 +693,11 @@ async function reloadCurrentTab() {
   pageLoading.value = true
   try {
     if (activeTab.value === 'rules') await loadRules()
+    else if (activeTab.value === 'org') await loadOrgTree()
     else if (activeTab.value === 'providers') await Promise.all([loadVendorSettings(), providerTable.value?.load()])
     else if (activeTab.value === 'access') await Promise.all([canReadRoles.value ? loadRoles() : Promise.resolve(), canReadRoles.value ? roleTable.value?.load() : Promise.resolve(), canReadUsers.value ? userTable.value?.load() : Promise.resolve()])
     else if (activeTab.value === 'metadata') await Promise.all([canReadTags.value ? tagTable.value?.load() : Promise.resolve(), canReadCustomFields.value ? customFieldTable.value?.load() : Promise.resolve()])
-    ElMessage.success('已刷新')
+    if (activeTab.value !== 'audit') ElMessage.success('已刷新')
   } finally { pageLoading.value = false }
 }
 
@@ -534,7 +750,8 @@ async function loadRoles() {
 }
 
 function openRole(row?: any) {
-  Object.assign(roleForm, row ? { id: row.id, name: row.name, permissions: normalizePermissions(row.permissions) } : { id: '', name: '', permissions: { brands: ['read'], contacts: ['read'], emails: ['read'], tasks: ['read'] } })
+  const defaultScopes = Object.fromEntries(Object.keys(permissionDefinitions).filter((key) => permissionDefinitions[key].dataScoped).map((key) => [key, 'unit']))
+  Object.assign(roleForm, row ? { id: row.id, name: row.name, permissions: normalizePermissions(row.permissions), data_scopes: { ...defaultScopes, ...(row.data_scopes || {}) } } : { id: '', name: '', permissions: { brands: ['read'], contacts: ['read'], emails: ['read'], tasks: ['read'] }, data_scopes: defaultScopes })
   roleVisible.value = true
 }
 
@@ -542,8 +759,8 @@ async function saveRole() {
   if (!roleForm.name.trim()) return ElMessage.warning('请填写角色名称')
   try {
     const permissions = Object.fromEntries(Object.entries(roleForm.permissions).filter(([, actions]) => actions.length))
-    if (roleForm.id) await api.patch(`/roles/${roleForm.id}`, { permissions })
-    else await api.post('/roles', { name: roleForm.name, permissions })
+    if (roleForm.id) await api.patch(`/roles/${roleForm.id}`, { permissions, data_scopes: roleForm.data_scopes })
+    else await api.post('/roles', { name: roleForm.name, permissions, data_scopes: roleForm.data_scopes })
     roleVisible.value = false
     await Promise.all([roleTable.value?.load(), loadRoles()])
     ElMessage.success('角色已保存')
@@ -551,7 +768,7 @@ async function saveRole() {
 }
 
 function openUser(row?: any) {
-  Object.assign(userForm, row ? { id: row.id, name: row.name, email: row.email, password: '', role_id: row.role_id || '', status: row.status } : { id: '', name: '', email: '', password: '', role_id: '', status: 'active' })
+  Object.assign(userForm, row ? { id: row.id, name: row.name, email: row.email, password: '', role_id: row.role_id || '', organization_unit_id: row.organization_unit_id || '', status: row.status } : { id: '', name: '', email: '', password: '', role_id: '', organization_unit_id: '', status: 'active' })
   userVisible.value = true
 }
 
@@ -559,7 +776,7 @@ async function saveUser() {
   if (!userForm.name.trim() || (!userForm.id && (!userForm.email.trim() || userForm.password.length < 8))) return ElMessage.warning('请填写姓名、邮箱和至少 8 位密码')
   try {
     if (userForm.id) {
-      const payload: Record<string, unknown> = { name: userForm.name, role_id: userForm.role_id || null, status: userForm.status }
+      const payload: Record<string, unknown> = { name: userForm.name, role_id: userForm.role_id || null, organization_unit_id: userForm.organization_unit_id || null, status: userForm.status }
       if (userForm.password) payload.password = userForm.password
       await api.patch(`/users/${userForm.id}`, payload)
     } else await api.post('/users', {
@@ -567,6 +784,7 @@ async function saveUser() {
       email: userForm.email.trim(),
       password: userForm.password,
       role_id: userForm.role_id || null,
+      organization_unit_id: userForm.organization_unit_id || null,
       status: userForm.status,
     })
     userVisible.value = false

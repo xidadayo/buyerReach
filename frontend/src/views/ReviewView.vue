@@ -127,11 +127,11 @@ import { api } from '../api/client'
 import { useAuth } from '../stores/auth'
 
 const auth = useAuth()
-const canImport = computed(() => auth.hasPermission('import:execute'))
-const canExport = computed(() => auth.hasPermission('export:execute'))
+const canImport = computed(() => auth.hasPermission('imports:execute'))
+const canExport = computed(() => auth.hasPermission('exports:execute'))
 const canDedup = computed(() => auth.hasPermission('dedup:execute'))
 const canReadBlacklist = computed(() => auth.hasPermission('blacklist:read'))
-const canWriteBlacklist = computed(() => auth.hasPermission('blacklist:write'))
+const canWriteBlacklist = computed(() => auth.hasPermission('blacklist:create'))
 
 const entityOptions = [{ label: '品牌', value: 'brands' }, { label: '联系人', value: 'contacts' }, { label: '邮箱', value: 'emails' }]
 const exportOptions = [...entityOptions, { label: '搜索任务', value: 'tasks' }, { label: '审计日志', value: 'audit_logs' }]

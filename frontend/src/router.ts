@@ -6,6 +6,7 @@ import TasksView from './views/TasksView.vue'
 import DataCenterView from './views/DataCenterView.vue'
 import ReviewView from './views/ReviewView.vue'
 import SettingsView from './views/SettingsView.vue'
+import OutreachView from './views/OutreachView.vue'
 import BatchExactBrandView from './views/BatchExactBrandView.vue'
 
 export const router = createRouter({
@@ -18,9 +19,10 @@ export const router = createRouter({
     { path: '/brands', redirect: (to) => ({ path: '/data', query: { ...to.query, tab: 'brands' } }) },
     { path: '/contacts', redirect: (to) => ({ path: '/data', query: { ...to.query, tab: 'contacts' } }) },
     { path: '/emails', redirect: (to) => ({ path: '/data', query: { ...to.query, tab: 'emails' } }) },
-    { path: '/review', component: ReviewView, meta: { title: '审核与去重', permissions: ['import:execute', 'export:execute', 'dedup:execute', 'blacklist:read'] } },
+    { path: '/review', component: ReviewView, meta: { title: '审核与去重', permissions: ['imports:read', 'imports:execute', 'exports:execute', 'dedup:read', 'blacklist:read'] } },
     { path: '/batch-exact-brand', component: BatchExactBrandView, meta: { title: '批量精准品牌' } },
-    { path: '/settings', component: SettingsView, meta: { title: '系统配置', permissions: ['settings:read', 'providers:read', 'roles:read', 'users:read', 'tags:read', 'custom_fields:read', 'audit:read'] } },
+    { path: '/settings', component: SettingsView, meta: { title: '系统配置', permissions: ['settings:read', 'providers:read', 'organization_units:read', 'roles:read', 'users:read', 'tags:read', 'custom_fields:read', 'audit:read'] } },
+    { path: '/outreach', component: OutreachView, meta: { title: '邮件触达', permissions: ['outreach:read'] } },
   ],
 })
 

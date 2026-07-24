@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -42,6 +43,8 @@ def _setup_two_orgs():
 def test_require_task_access_own_org_returns_task() -> None:
     db, org_id, _, task_id, _ = _setup_two_orgs()
     user = User(id=uuid4(), organization_id=org_id, email="a@b.com", name="Tester")
+    db.get(SearchTask, task_id).owner_id = user.id
+    db.commit()
     task = require_task_access(db, task_id, user)
     assert task is not None
     assert str(task.name) == "org1-task"
@@ -72,8 +75,8 @@ def test_require_task_access_nonexistent_raises_404() -> None:
         assert exc.status_code == 404
 
 
-def test_require_task_access_no_org_user_returns_task() -> None:
-    """User without org should still access task without org (legacy tasks)."""
+def test_require_task_access_no_org_user_is_denied() -> None:
+    """Unscoped legacy rows are fail-closed for non-platform users."""
     db, _, _, task1_id, _ = _setup_two_orgs()
     # Remove org from task via model update
     task_row = db.get(SearchTask, task1_id)
@@ -81,8 +84,11 @@ def test_require_task_access_no_org_user_returns_task() -> None:
     db.commit()
 
     user = User(id=uuid4(), organization_id=None, email="legacy@b.com", name="Legacy")
-    task = require_task_access(db, task1_id, user)
-    assert task is not None
+    try:
+        require_task_access(db, task1_id, user)
+        assert False, "Should have raised 404"
+    except HTTPException as exc:
+        assert exc.status_code == 404
 
 
 def test_query_plan_org_isolation_API_guard() -> None:

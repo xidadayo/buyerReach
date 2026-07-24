@@ -64,8 +64,12 @@ class UserProfile(BaseModel):
     name: str
     role: str | None
     organization_name: str | None
+    organization_unit_id: str | None = None
+    organization_unit_name: str | None = None
     status: str
     permissions: list[str]
+    data_scopes: dict[str, str] | None = None
+    permission_version: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +98,21 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
         if org:
             org_name = org.name
 
+    org_unit_id = None
+    org_unit_name = None
+    if getattr(user, "organization_unit_id", None):
+        from app.modules.models import OrganizationUnit
+        unit = db.get(OrganizationUnit, user.organization_unit_id)
+        if unit:
+            org_unit_id = str(unit.id)
+            org_unit_name = unit.name
+
+    data_scopes = None
+    permission_version = None
+    if role:
+        data_scopes = role.data_scopes if isinstance(role.data_scopes, dict) else None
+        permission_version = role.permission_version
+
     extra = {
         "email": user.email,
         "name": user.name,
@@ -116,8 +135,12 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
             "name": user.name,
             "role": role_name,
             "organization_name": org_name,
+            "organization_unit_id": org_unit_id,
+            "organization_unit_name": org_unit_name,
             "status": user.status,
             "permissions": sorted(get_user_permissions(db, user)),
+            "data_scopes": data_scopes,
+            "permission_version": permission_version,
         },
     }
 
@@ -164,18 +187,34 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> dict:
 @auth_router.get("/me", response_model=UserProfile)
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     role_name = "viewer"
+    role = None
+    data_scopes: dict[str, str] | None = None
+    permission_version: int | None = None
+
     if user.role_id:
         from app.modules.models import Role
         role = db.get(Role, user.role_id)
         if role:
             role_name = role.name
+            data_scopes = role.data_scopes if isinstance(role.data_scopes, dict) else None
+            permission_version = role.permission_version
 
     org_name = None
+    org_unit_id = None
+    org_unit_name = None
+
     if user.organization_id:
         from app.modules.models import Organization
         org = db.get(Organization, user.organization_id)
         if org:
             org_name = org.name
+
+    if getattr(user, "organization_unit_id", None):
+        from app.modules.models import OrganizationUnit
+        unit = db.get(OrganizationUnit, user.organization_unit_id)
+        if unit:
+            org_unit_id = str(unit.id)
+            org_unit_name = unit.name
 
     return {
         "id": str(user.id),
@@ -183,8 +222,12 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         "name": user.name,
         "role": role_name,
         "organization_name": org_name,
+        "organization_unit_id": org_unit_id,
+        "organization_unit_name": org_unit_name,
         "status": user.status,
         "permissions": sorted(get_user_permissions(db, user)),
+        "data_scopes": data_scopes,
+        "permission_version": permission_version,
     }
 
 

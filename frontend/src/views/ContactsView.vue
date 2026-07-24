@@ -2,6 +2,7 @@
   <div class="page-heading">
     <h1 class="page-title">联系人</h1>
     <el-space>
+      <DataAssignmentButton resource="contacts" :ids="selectedRows.map((row) => row.id)" @assigned="afterAssigned" />
       <el-button :disabled="!selectedRows.length" :loading="exporting" @click="exportSelected">批量导出 {{ selectedRows.length ? `(${selectedRows.length})` : '' }}</el-button>
       <el-button type="danger" :disabled="!selectedRows.length" :loading="archiving" @click="archiveSelected">批量删除 {{ selectedRows.length ? `(${selectedRows.length})` : '' }}</el-button>
       <el-button type="primary" @click="openDialog">新增联系人</el-button>
@@ -24,7 +25,7 @@
       />
       <el-button type="primary" @click="applySearch">搜索</el-button>
     </div>
-    <EntityTable ref="table" endpoint="/contacts" :columns="columns" :query-params="contactQuery" selectable @selection-change="onSelectionChange">
+    <EntityTable ref="table" endpoint="/contacts" :columns="columns" :query-params="contactQuery" selectable :row-selectable="isSelectable" @selection-change="onSelectionChange">
       <template #cell-linkedin_url="{ value }">
         <a v-if="value" :href="value" target="_blank" rel="noreferrer">LinkedIn</a><span v-else>-</span>
       </template>
@@ -35,7 +36,8 @@
         <el-tag size="small" :type="contactStatusType(value)">{{ contactStatusLabel(value) }}</el-tag>
       </template>
       <template #actions="{ row }">
-        <el-button size="small" :disabled="!row.email_count" @click="viewEmails(row)">查看邮箱</el-button>
+        <el-tag v-if="row.is_shared_context" size="small" type="info">共享关联（只读）</el-tag>
+        <el-button v-else size="small" :disabled="!row.email_count" @click="viewEmails(row)">查看邮箱</el-button>
       </template>
     </EntityTable>
   </div>
@@ -64,6 +66,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { nextTick, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
+import DataAssignmentButton from '../components/DataAssignmentButton.vue'
 import { api } from '../api/client'
 
 const table = ref<InstanceType<typeof EntityTable>>()
@@ -74,11 +77,18 @@ const archiving = ref(false)
 const exporting = ref(false)
 const brands = ref<any[]>([])
 const selectedRows = ref<Record<string, any>[]>([])
+
+async function afterAssigned() {
+  selectedRows.value = []
+  await table.value?.load()
+}
 const searchInput = ref('')
 const contactQuery = ref<Record<string, string>>({})
 const lastExport = ref<{ count: number; filename: string; url: string } | null>(null)
 const form = reactive({ brand_id: '', first_name: '', last_name: '', title: '', linkedin_url: '' })
 const columns: TableColumn[] = [
+  { key: 'department_name', label: '所属组', width: 130 },
+  { key: 'owner_name', label: '负责人', width: 110 },
   { key: 'full_name', label: '姓名', width: 160 },
   { key: 'title', label: '职位', width: 180 },
   { key: 'brand_name', label: '品牌', width: 160 },
@@ -128,6 +138,10 @@ async function save() {
 
 function onSelectionChange(rows: Record<string, any>[]) {
   selectedRows.value = rows
+}
+
+function isSelectable(row: Record<string, any>) {
+  return !row.is_shared_context
 }
 
 async function applySearch() {

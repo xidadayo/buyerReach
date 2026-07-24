@@ -10,8 +10,12 @@ interface UserInfo {
   name: string
   role: string | null
   organization_name: string | null
+  organization_unit_id: string | null
+  organization_unit_name: string | null
   status: string
   permissions: string[]
+  data_scopes: Record<string, string> | null
+  permission_version: number | null
 }
 
 interface AuthState {
@@ -100,6 +104,19 @@ function changePassword(currentPassword: string, newPassword: string) {
   return api.post('/auth/change-password', { current_password: currentPassword, new_password: newPassword })
 }
 
+export function hasPermission(permission: string): boolean {
+  if (!state.user?.permissions) return false
+  return state.user.permissions.includes('admin:*') || state.user.permissions.includes(permission)
+}
+
+export function hasAnyPermission(permissions: string[]): boolean {
+  return permissions.some(hasPermission)
+}
+
+export function dataScope(resource: string): string {
+  return state.user?.data_scopes?.[resource] || 'self'
+}
+
 export function useAuth() {
   return {
     state,
@@ -109,7 +126,8 @@ export function useAuth() {
     refreshAccessToken,
     changePassword,
     isAuthenticated: () => !!state.token,
-    hasPermission: (permission: string) => state.user?.permissions?.includes('admin:*') || state.user?.permissions?.includes(permission) || false,
-    hasAnyPermission: (permissions: string[]) => permissions.some((permission) => state.user?.permissions?.includes('admin:*') || state.user?.permissions?.includes(permission)),
+    hasPermission,
+    hasAnyPermission,
+    dataScope,
   }
 }

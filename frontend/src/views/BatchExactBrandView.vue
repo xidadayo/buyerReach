@@ -271,7 +271,7 @@ const limits = { maxRows: 5000, maxFileSizeMb: 10 }
 const settings = reactive({
   name: '',
   vendorMode: 'apollo_hunter' as string,
-  targetTitles: 'Buyer,Head of Buying,Sourcing Manager,Procurement Manager',
+  targetTitles: '',
   contactsLimit: 5,
   reliableEmailOnly: true,
   skipExistingBrands: false,
@@ -348,6 +348,16 @@ async function loadVendorCapabilities() {
     )
   } catch {
     vendorCapabilities.value = {}
+  }
+}
+
+async function loadTaskDefaults() {
+  try {
+    const { data } = await api.get('/task-defaults')
+    settings.targetTitles = Array.isArray(data?.target_titles) ? data.target_titles.join(',') : ''
+    settings.contactsLimit = Number(data?.contacts_limit_per_brand || 5)
+  } catch {
+    settings.targetTitles = ''
   }
 }
 
@@ -556,6 +566,7 @@ function executionStatusType(status: string) {
 let timer: number | undefined
 onMounted(() => {
   loadVendorCapabilities()
+  loadTaskDefaults()
   // Poll for target updates when on step 4
   timer = window.setInterval(() => {
     if (activeStep.value === 3 && confirmResult.value?.parent_task_id) {

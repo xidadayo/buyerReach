@@ -29,6 +29,10 @@ celery_app.conf.beat_schedule = {
         "task": "buyerreach.schedule_batch_targets",
         "schedule": 10.0,
     },
+    "dispatch-outreach": {
+        "task": "buyerreach.dispatch_outreach",
+        "schedule": 30.0,
+    },
 }
 
 
@@ -97,7 +101,10 @@ def recover_queued_search_tasks(**_: object) -> None:
 
         db.commit()
         task_ids = db.scalars(
-            select(SearchTask.id).where(SearchTask.status == TaskStatus.queued)
+            select(SearchTask.id).where(
+                SearchTask.status == TaskStatus.queued,
+                SearchTask.mode != "batch_exact_brand",
+            )
         ).all()
         candidate_ids = db.scalars(
             select(DiscoveryCandidate.id).where(
@@ -141,17 +148,42 @@ def publish_domain_outbox_job(limit: int = 100) -> dict:
     return {"published": published, "failed": failed}
 
 
+@celery_app.task(name="buyerreach.dispatch_outreach")
+def dispatch_outreach_job(limit: int = 100) -> dict:
+    """Durably evaluate due mail; external transport remains feature-configured."""
+    from app.core.database import SessionLocal
+    from app.modules.outreach import dispatch_due_messages
+    with SessionLocal() as db:
+        result = dispatch_due_messages(db, limit)
+        db.commit()
+        return result
+
+
 @celery_app.task(name="buyerreach.execute_search_task")
 def execute_search_task_job(task_id: str) -> dict:
     from uuid import UUID
 
     from app.core.database import SessionLocal
+    from app.modules.models import SearchTask
     from app.modules.services import execute_search_task
+    from app.shared.enums import TaskStatus
 
     with SessionLocal() as db:
-        task = execute_search_task(db, UUID(task_id))
-        db.commit()
-        return {"task_id": str(task.id), "status": task.status, "error_message": task.error_message}
+        try:
+            task = execute_search_task(db, UUID(task_id))
+            db.commit()
+            return {"task_id": str(task.id), "status": task.status, "error_message": task.error_message}
+        except Exception as exc:
+            db.rollback()
+            # execute_search_task commits the running state before the pipeline
+            # runs, so without this handler a crash leaves the task "running"
+            # forever in the UI.
+            task = db.get(SearchTask, UUID(task_id))
+            if task is not None and task.status in {TaskStatus.queued, TaskStatus.running}:
+                task.status = TaskStatus.failed
+                task.error_message = str(exc)[:2000]
+                db.commit()
+            raise
 
 
 @celery_app.task(

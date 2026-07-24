@@ -21,7 +21,12 @@ let refreshPromise: Promise<boolean> | null = null
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    if (error.response?.status === 401 && !error.config._retry) {
+    // A rejected login is an expected authentication result, not an expired
+    // session. Refreshing and redirecting here cleared LoginView's error state
+    // before the user could read it.
+    const requestUrl = String(error.config?.url || '')
+    const isAuthenticationRequest = requestUrl.includes('/auth/login') || requestUrl.includes('/auth/refresh')
+    if (error.response?.status === 401 && !isAuthenticationRequest && !error.config._retry) {
       error.config._retry = true
       if (!refreshPromise) {
         const { refreshAccessToken } = useAuth()

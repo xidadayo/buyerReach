@@ -555,6 +555,7 @@ def create_batch_import(
     file_hash: str,
     parsed_rows: list[dict],
     organization_id: UUID | None = None,
+    organization_unit_id: UUID | None = None,
     created_by: UUID | None = None,
 ) -> BatchImport:
     """Persist a BatchImport from preview data. Does NOT create targets or call vendors."""
@@ -584,6 +585,8 @@ def create_batch_import(
     batch = BatchImport(
         id=uuid4(),
         organization_id=organization_id,
+        department_id=organization_unit_id,
+        owner_id=created_by,
         created_by=created_by,
         filename=filename,
         template_version=TEMPLATE_VERSION,

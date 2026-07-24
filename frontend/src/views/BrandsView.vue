@@ -2,12 +2,13 @@
   <div class="page-heading">
     <h1 class="page-title">品牌库</h1>
     <el-space>
+      <DataAssignmentButton resource="brands" :ids="selectedRows.map((row) => row.id)" @assigned="afterAssigned" />
       <el-button type="danger" :disabled="!selectedRows.length" :loading="archiving" @click="archiveSelected">批量删除 {{ selectedRows.length ? `(${selectedRows.length})` : '' }}</el-button>
       <el-button type="primary" @click="dialogVisible = true">新增品牌</el-button>
     </el-space>
   </div>
   <div class="panel">
-    <EntityTable ref="table" endpoint="/brands" :columns="columns" selectable @selection-change="onSelectionChange">
+    <EntityTable ref="table" endpoint="/brands" :columns="columns" selectable :row-selectable="isSelectable" @selection-change="onSelectionChange">
       <template #cell-primary_website="{ value }">
         <a v-if="value" :href="value" target="_blank" rel="noreferrer">{{ value }}</a>
         <span v-else>-</span>
@@ -32,6 +33,8 @@
         <span v-else>0</span>
       </template>
       <template #actions="{ row }">
+        <el-tag v-if="row.is_shared_context" size="small" type="info">共享关联（只读）</el-tag>
+        <template v-else>
         <el-button size="small" @click="openEdit(row)">编辑</el-button>
         <el-button
           v-if="row.primary_website"
@@ -42,6 +45,7 @@
           {{ row.category ? '解析官网' : '获取官网行业' }}
         </el-button>
         <el-button size="small" type="danger" plain @click="archive(row)">归档</el-button>
+        </template>
       </template>
     </EntityTable>
   </div>
@@ -98,6 +102,7 @@
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { reactive, ref } from 'vue'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
+import DataAssignmentButton from '../components/DataAssignmentButton.vue'
 import { api } from '../api/client'
 
 const table = ref<InstanceType<typeof EntityTable>>()
@@ -109,8 +114,15 @@ const parsingId = ref('')
 const parseResult = ref<any>(null)
 const parseVisible = ref(false)
 const selectedRows = ref<Record<string, any>[]>([])
+
+async function afterAssigned() {
+  selectedRows.value = []
+  await table.value?.load()
+}
 const form = reactive({ name: '', company_name: '', website: '', country: '', category: '' })
 const columns: TableColumn[] = [
+  { key: 'department_name', label: '所属组', width: 130 },
+  { key: 'owner_name', label: '负责人', width: 110 },
   { key: 'name', label: '品牌名称', width: 180 },
   { key: 'company_name', label: '公司', width: 180 },
   { key: 'primary_website', label: '官网', width: 220 },
@@ -159,6 +171,10 @@ async function archive(row: any) {
 
 function onSelectionChange(rows: Record<string, any>[]) {
   selectedRows.value = rows
+}
+
+function isSelectable(row: Record<string, any>) {
+  return !row.is_shared_context
 }
 
 async function archiveSelected() {

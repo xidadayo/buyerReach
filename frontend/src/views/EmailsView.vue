@@ -2,6 +2,7 @@
   <div class="page-heading">
     <h1 class="page-title">邮箱池</h1>
     <el-space>
+      <DataAssignmentButton resource="emails" :ids="selectedRows.map((row) => row.id)" @assigned="afterAssigned" />
       <el-button :disabled="!selectedRows.length" :loading="exporting" @click="exportSelected">批量导出 {{ selectedRows.length ? `(${selectedRows.length})` : '' }}</el-button>
       <el-button type="danger" :disabled="!selectedRows.length" :loading="archiving" @click="archiveSelected">批量删除 {{ selectedRows.length ? `(${selectedRows.length})` : '' }}</el-button>
       <el-button type="primary" @click="openDialog">新增邮箱</el-button>
@@ -129,6 +130,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import EntityTable, { type TableColumn } from '../components/EntityTable.vue'
+import DataAssignmentButton from '../components/DataAssignmentButton.vue'
 import { api } from '../api/client'
 
 const table = ref<InstanceType<typeof EntityTable>>()
@@ -154,12 +156,19 @@ const exporting = ref(false)
 const contacts = ref<any[]>([])
 const brands = ref<any[]>([])
 const selectedRows = ref<Record<string, any>[]>([])
+
+async function afterAssigned() {
+  selectedRows.value = []
+  await table.value?.load()
+}
 const lastExport = ref<{ count: number; filename: string; url: string } | null>(null)
 const detailVisible = ref(false)
 const detailLoading = ref(false)
 const detail = ref<Record<string, any> | null>(null)
 const form = reactive({ contact_id: '', brand_id: '', address: '', type: 'personal' })
 const columns: TableColumn[] = [
+  { key: 'department_name', label: '所属组', width: 130 },
+  { key: 'owner_name', label: '负责人', width: 110 },
   { key: 'address', label: '邮箱地址', width: 220 },
   { key: 'contact_name', label: '联系人', width: 160 },
   { key: 'brand_name', label: '所属品牌', width: 160 },
